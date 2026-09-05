@@ -1,3 +1,5 @@
+import{TIME_BASE_MINUTES,RIDE_MINUTES_PER_HOP,DWELL_MINUTES_PER_STOP,nextDeparture}from'../schedule.js';
+
 const graphCache=new WeakMap();
 
 function buildGraph(lines){
@@ -15,7 +17,7 @@ function buildGraph(lines){
 }
 
 class MinHeap{
- constructor(){this.items=[]}
+ constructor(compare=(a,b)=>a.cost-b.cost){this.items=[];this.compare=compare}
  get size(){return this.items.length}
  push(item){
   const items=this.items;
@@ -23,7 +25,7 @@ class MinHeap{
   let index=items.length-1;
   while(index>0){
    const parent=(index-1)>>1;
-   if(items[parent].cost<=items[index].cost)break;
+   if(this.compare(items[parent],items[index])<=0)break;
    [items[parent],items[index]]=[items[index],items[parent]];
    index=parent;
   }
@@ -36,8 +38,8 @@ class MinHeap{
    while(true){
     const left=index*2+1,right=index*2+2;
     let smallest=index;
-    if(left<items.length&&items[left].cost<items[smallest].cost)smallest=left;
-    if(right<items.length&&items[right].cost<items[smallest].cost)smallest=right;
+    if(left<items.length&&this.compare(items[left],items[smallest])<0)smallest=left;
+    if(right<items.length&&this.compare(items[right],items[smallest])<0)smallest=right;
     if(smallest===index)break;
     [items[index],items[smallest]]=[items[smallest],items[index]];
     index=smallest;
@@ -64,7 +66,72 @@ function planLeg(from,to,lines){
  return[];
 }
 
-function planTrip({origin,destinations,lines}){
+// Search all waypoints with the same boarding/dwell rules as the simulator.
+// Keep the last ridden line after alighting: the judge counts line changes
+// across leg boundaries even though boarding now requires a fresh wait.
+function planTripAtTime({origin,destinations,lines,departureMinute}){
+ const graph=buildGraph(lines),heap=new MinHeap((a,b)=>a.estimate-b.estimate||a.transfers-b.transfers),labels=new Map();
+ // A lower bound that ignores all waits keeps the search focused on the
+ // remaining itinerary, especially on dense networks with many bus lines.
+ const distances=new Map();
+ for(const target of new Set(destinations)){
+  const distance=new Map([[target,0]]),queue=[target];
+  for(let i=0;i<queue.length;i++)for(const edge of graph.get(queue[i])||[]){
+   if(!distance.has(edge.to)){distance.set(edge.to,distance.get(queue[i])+1);queue.push(edge.to)}
+  }
+  distances.set(target,distance);
+ }
+ const minimumLeg=(from,to)=>from===to?0:
+  (distances.get(to).get(from)??Infinity)*RIDE_MINUTES_PER_HOP+(to!==origin?DWELL_MINUTES_PER_STOP:0);
+ const suffix=Array(destinations.length+1).fill(0);
+ for(let i=destinations.length-1;i>0;i--)suffix[i]=suffix[i+1]+minimumLeg(destinations[i-1],destinations[i]);
+ if(destinations.length&&!Number.isFinite(minimumLeg(origin,destinations[0])+suffix[1]))return planTrip({origin,destinations,lines});
+ const enqueue=state=>{
+  state.estimate=state.clock+(state.idx<destinations.length?minimumLeg(state.stop,destinations[state.idx])+suffix[state.idx+1]:0);
+  const key=JSON.stringify([state.idx,state.stop,state.line,state.lastLine]);
+  const existing=labels.get(key)||[];
+  // A later arrival with fewer transfers can catch the same onward bus.
+  // Neither label dominates the other; retain both for the final tiebreak.
+  if(existing.some(label=>label.clock<=state.clock&&label.transfers<=state.transfers))return;
+  const remaining=existing.filter(label=>{
+   if(state.clock<=label.clock&&state.transfers<=label.transfers){label.stale=true;return false}
+   return true;
+  });
+  remaining.push(state);labels.set(key,remaining);heap.push(state);
+ };
+ enqueue({idx:0,stop:origin,line:null,lastLine:null,clock:departureMinute+TIME_BASE_MINUTES,transfers:0,parent:null});
+ while(heap.size){
+  const current=heap.pop();
+  if(current.stale)continue;
+  if(current.idx===destinations.length){
+   const trip=destinations.map((to,index)=>({from:index?destinations[index-1]:origin,to,steps:[]}));
+   for(let node=current;node.parent;node=node.parent){
+    if(node.step)trip[node.parent.idx].steps.push(node.step);
+   }
+   trip.forEach(leg=>leg.steps.reverse());
+   return trip;
+  }
+  const target=destinations[current.idx];
+  if(current.stop===target){
+   // Empty legs neither dwell nor clear the boarded line in schedule.js.
+   enqueue({...current,idx:current.idx+1,parent:current,step:null});
+   continue;
+  }
+  for(const edge of graph.get(current.stop)||[]){
+   const clock=(current.line===edge.line?current.clock:nextDeparture(edge.line,lines,current.clock))+RIDE_MINUTES_PER_HOP;
+   const arrived=edge.to===target,dwell=arrived&&target!==origin;
+   enqueue({idx:current.idx+(arrived?1:0),stop:edge.to,line:dwell?null:edge.line,lastLine:edge.line,
+    clock:clock+(dwell?DWELL_MINUTES_PER_STOP:0),
+    transfers:current.transfers+(current.lastLine!==null&&current.lastLine!==edge.line?1:0),
+    parent:current,step:{from:current.stop,to:edge.to,line:edge.line}});
+  }
+ }
+ // Preserve partial routes on disconnected networks, as in untimed calls.
+ return planTrip({origin,destinations,lines});
+}
+
+function planTrip({origin,destinations,lines,departureMinute}){
+ if(Number.isFinite(departureMinute))return planTripAtTime({origin,destinations,lines,departureMinute});
  return destinations.map((destination,index)=>{
   const from=index?destinations[index-1]:origin;
   return{from,to:destination,steps:planLeg(from,destination,lines)};

@@ -30,22 +30,26 @@ export function nextDeparture(lineId,lines,atMinute){
 // schedule-aware or not, so this is the one source of truth for "how long
 // did this trip actually take" everywhere in the app.
 export function simulateTripTiming(trip,destinations,start,departureMinute,lines){
+ const events=[{type:'walk',from:start,to:start,start:departureMinute,end:departureMinute+TIME_BASE_MINUTES}];
  let clock=departureMinute+TIME_BASE_MINUTES,waitMinutes=0,rideMinutes=0,dwellMinutes=0,currentLine=null,hops=0;
  (Array.isArray(trip)?trip:[]).forEach((leg,legIndex)=>{
   const steps=Array.isArray(leg.steps)?leg.steps:[];
   steps.forEach(step=>{
    if(step.line!==currentLine){
     const departAt=nextDeparture(step.line,lines,clock);
+    if(departAt>clock)events.push({type:'wait',from:step.from,to:step.from,line:step.line,start:clock,end:departAt});
     waitMinutes+=departAt-clock;
     clock=departAt;
     currentLine=step.line;
    }
+   events.push({type:'ride',...step,start:clock,end:clock+RIDE_MINUTES_PER_HOP});
    clock+=RIDE_MINUTES_PER_HOP;
    rideMinutes+=RIDE_MINUTES_PER_HOP;
    hops++;
   });
   const arrivedAt=destinations[legIndex];
   if(steps.length&&arrivedAt!==start){
+   events.push({type:'visit',from:arrivedAt,to:arrivedAt,start:clock,end:clock+DWELL_MINUTES_PER_STOP});
    clock+=DWELL_MINUTES_PER_STOP;
    dwellMinutes+=DWELL_MINUTES_PER_STOP;
    currentLine=null;
@@ -56,5 +60,6 @@ export function simulateTripTiming(trip,destinations,start,departureMinute,lines
   waitMinutes,
   rideMinutes,
   dwellMinutes,
+  events:hops?events:[],
  };
 }

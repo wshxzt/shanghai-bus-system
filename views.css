@@ -1189,3 +1189,18 @@
 
 
 
+
+/* Follow Bunny's bus and see each boarding change. */
+.active-step{background:#eaf4ee;border:1px solid #9ebfae;border-radius:10px;padding:12px 8px;margin:4px -8px}
+.transfer-instruction{display:flex;gap:8px;margin:12px 0 2px;padding:10px;border-left:3px solid #d88147;background:#fcf1e5;border-radius:0 8px 8px 0;color:#80532c}
+.transfer-instruction svg{flex:none;margin-top:2px}
+.transfer-instruction b,.transfer-instruction span,.transfer-instruction small{display:block;font-size:11px;line-height:1.5}
+.transfer-instruction span{margin-top:3px}.transfer-instruction small{font-size:10px;color:#866c52}
+.transfer-instruction.active{border-color:#285f52;background:#eaf4ee;color:#285f52}
+.ride-status{position:absolute;left:22px;bottom:24px;z-index:1000;display:flex;gap:12px;width:min(380px,calc(100% - 44px));padding:16px;background:#fffdf8f5;border:1px solid #c5d4c9;border-radius:16px;box-shadow:0 8px 28px #203a3226;pointer-events:none}
+.ride-status-icon{color:white;flex:none;width:48px;height:48px;display:grid;place-items:center;border-radius:12px}
+.ride-status small{display:block;color:#678075;font-size:9px;letter-spacing:1px}
+.ride-status b{display:block;font-size:16px;margin:5px 0;color:#254a42}
+.ride-status span,.ride-status p{font-size:11px;line-height:1.5;color:#5c7168}
+.ride-status p{margin:9px 0 0;padding-top:8px;border-top:1px solid #dde5de}
+.map:has(.ride-status) .legend{display:none}

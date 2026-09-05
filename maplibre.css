@@ -18,3 +18,8 @@
 .geo-bunny b{font-size:9px;background:#285f52;color:#fff;padding:6px 9px;border-radius:8px;margin-left:4px}
 .geo-bunny.riding span{border-color:#e9685d;animation:bunnyHop .8s ease-in-out infinite alternate}.geo-bunny.riding b{background:#e9685d}
 @keyframes bunnyHop{to{transform:translateY(-4px)}}
+.geo-bunny .bunny-bus{display:none;font-style:normal;font-size:30px;line-height:1;background:var(--ride-color,#285f52);border:3px solid white;border-radius:10px;padding:5px;box-shadow:0 2px 8px #203a3240}
+.geo-bunny.riding .bunny-bus{display:block;margin-left:-9px}
+.geo-bunny.riding span{border-color:var(--ride-color,#285f52);animation:none;position:relative;z-index:1;width:30px;height:30px;font-size:20px}
+.geo-bunny.riding b{background:var(--ride-color,#285f52)}
+.transfer-pin{width:28px;height:28px;display:grid;place-items:center;background:#fff4e6;color:#9a531e;border:2px solid #c97736;border-radius:50%;font-size:20px;font-weight:800;box-shadow:0 2px 6px #203a3230}

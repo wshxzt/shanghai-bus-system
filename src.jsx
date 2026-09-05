@@ -8,6 +8,7 @@ import'./maplibre.css';
 import'./views.css';
 import{getRoutePlanner,routePlanners,defaultRoutePlannerId}from'./route-planners/index.js';
 import{simulateTripTiming,lineFrequency}from'./schedule.js';
+import{boardingGroups,journeyPosition}from'./journey.js';
 import PlannerJudgeView from'./PlannerJudgeView.jsx';
 
 const spots=[
@@ -69,8 +70,8 @@ const arteries=[
  'M66 14 C75 18 83 28 87 40 C91 54 90 74 82 91',
  'M66 49 C78 47 89 47 99 50'
 ];
-function MapScene({from,targets,bunnyCoord,trip,progress,simSeconds,onSelect,spots=initialSpots,lines=initialLines}){
- const container=useRef(null),map=useRef(null),bunny=useRef(null),buses=useRef([]),itineraryMarkers=useRef([]),networkLayers=useRef([]),[ready,setReady]=useState(false),[mapError,setMapError]=useState(false);
+function MapScene({from,targets,bunnyCoord,rideEvent,rideLabel,groups,trip,progress,simSeconds,onSelect,spots=initialSpots,lines=initialLines}){
+ const container=useRef(null),map=useRef(null),bunny=useRef(null),buses=useRef([]),itineraryMarkers=useRef([]),networkLayers=useRef([]),transferMarkers=useRef([]),[ready,setReady]=useState(false),[mapError,setMapError]=useState(false);
  const lineCoordinates=useMemo(()=>Object.fromEntries(lines.map(l=>[l.id,l.stops.map(id=>spots.find(s=>s.id===id)?.coord||[121.48,31.23])])),[spots,lines]);
 
  useEffect(()=>{
@@ -110,7 +111,7 @@ function MapScene({from,targets,bunnyCoord,trip,progress,simSeconds,onSelect,spo
   if(bunny.current)bunny.current.remove();
   const currentFrom = spots.find(s=>s.id===from) || spots[0];
   if(currentFrom){
-   const bicon=L.divIcon({className:'leaflet-bunny',html:'<div class="geo-bunny"><span>🐰</span><b>You are here</b></div>',iconSize:[130,42],iconAnchor:[19,42]});
+   const bicon=L.divIcon({className:'leaflet-bunny',html:'<div class="geo-bunny"><span>🐰</span><i class="bunny-bus">🚌</i><b>You are here</b></div>',iconSize:[130,42],iconAnchor:[19,42]});
    bunny.current=L.marker([currentFrom.coord[1],currentFrom.coord[0]],{icon:bicon,zIndexOffset:1000}).addTo(m);
   }
 
@@ -124,7 +125,27 @@ function MapScene({from,targets,bunnyCoord,trip,progress,simSeconds,onSelect,spo
  useEffect(()=>{if(!map.current)return;const points=[from,...targets].map(id=>spots.find(s=>s.id===id)?.coord||[121.48,31.23]);if(points.length===1){map.current.setView([points[0][1],points[0][0]],12,{animate:true});return}map.current.fitBounds(points.map(([lng,lat])=>[lat,lng]),{paddingTopLeft:[90,105],paddingBottomRight:[90,90],maxZoom:13.4,animate:true})},[from,targets,spots]);
  useEffect(()=>{if(!map.current)return;itineraryMarkers.current.forEach(marker=>marker.remove());itineraryMarkers.current=targets.map((id,i)=>{const s=spots.find(x=>x.id===id);if(!s)return null;const icon=L.divIcon({className:'leaflet-itinerary',html:`<span class="itinerary-map-index">${i+1}</span>`,iconSize:[22,22],iconAnchor:[-5,45]});return L.marker([s.coord[1],s.coord[0]],{icon,zIndexOffset:850,interactive:false}).addTo(map.current)}).filter(Boolean)},[targets,spots]);
  useEffect(()=>{buses.current.forEach(x=>{const t=(simSeconds/1800+x.off)%1;x.marker.setLatLng([x.a[1]+(x.b[1]-x.a[1])*t,x.a[0]+(x.b[0]-x.a[0])*t])})},[simSeconds]);
- useEffect(()=>{if(!bunny.current||!bunnyCoord)return;bunny.current.setLatLng([bunnyCoord[1],bunnyCoord[0]]);const el=bunny.current.getElement();if(el){el.querySelector('.geo-bunny')?.classList.toggle('riding',!!trip);const label=el.querySelector('b');if(label)label.textContent=trip?`On the way · ${Math.round(progress)}%`:'You are here'}},[bunnyCoord,trip,progress]);
+ useEffect(()=>{
+  if(!map.current)return;
+  transferMarkers.current.forEach(marker=>marker.remove());
+  transferMarkers.current=groups.filter(group=>group.previousLine&&group.previousLine!==group.line).map(group=>{
+   const spot=spots.find(spot=>spot.id===group.from);if(!spot)return null;
+   const label=document.createElement('div');label.className='transfer-pin';label.textContent='⇄';
+   const icon=L.divIcon({className:'leaflet-transfer',html:label,iconSize:[28,28],iconAnchor:[14,14]});
+   const tooltip=document.createElement('div');tooltip.textContent=`Transfer at ${spot.name}: ${group.previousLine} → ${group.line}`;
+   return L.marker([spot.coord[1],spot.coord[0]],{icon,zIndexOffset:900}).bindTooltip(tooltip).addTo(map.current);
+  }).filter(Boolean);
+ },[groups,spots]);
+ useEffect(()=>{
+  if(!bunny.current||!bunnyCoord)return;
+  bunny.current.setLatLng([bunnyCoord[1],bunnyCoord[0]]);
+  const el=bunny.current.getElement(),riding=rideEvent?.type==='ride';
+  if(el){
+   const marker=el.querySelector('.geo-bunny');marker?.classList.toggle('riding',riding);
+   marker?.style.setProperty('--ride-color',lines.find(line=>line.id===rideEvent?.line)?.color||'#285f52');
+   const label=el.querySelector('b');if(label)label.textContent=trip?rideLabel:'You are here';
+  }
+ },[bunnyCoord,trip,rideEvent,rideLabel,lines]);
  return <><div ref={container} className="real-map"/>{!ready&&<div className={'map-status '+(mapError?'failed':'')}><span>{mapError?'Map data could not load':'Loading real Shanghai map…'}</span><small>{mapError?'Check the internet connection and refresh.':'Roads, waterways and buildings'}</small></div>}</>;
 }
 const Bunny=({small=false})=><span className={'bunny '+(small?'small':'')}><i className="ear e1"/><i className="ear e2"/><i className="head">• ᴗ •</i><i className="body"/></span>;
@@ -168,6 +189,7 @@ function App(){
  // schedule, and refine the guess from that - typically settles in 1-2
  // passes since schedules only change at a handful of minute-of-day marks.
  const plan=useMemo(()=>{
+  if(trip)return trip.plan;
   const solveAt=departureMinute=>{
    const legs=activeRoutePlanner.planTrip({origin:from,destinations:plannedDestinations,lines,departureMinute});
    const timing=simulateTripTiming(legs,plannedDestinations,from,departureMinute,lines);
@@ -205,19 +227,27 @@ function App(){
    if(better){best=candidate;bestGuess=candidateGuess;bestArrival=candidateArrival}
   }
   return best;
- },[planningMode,planningTime,simSeconds,activeRoutePlanner,from,plannedDestinations,lines]);
+ },[trip,planningMode,planningTime,simSeconds,activeRoutePlanner,from,plannedDestinations,lines]);
  const{legs,timing}=plan,durationMinutes=timing.timeMinutes;
  const result=useMemo(()=>legs.flatMap(l=>l.steps),[legs]);
- const groups=useMemo(()=>result.reduce((combined,step)=>{const previous=combined.at(-1);if(previous&&previous.line===step.line&&previous.to===step.from){previous.to=step.to;previous.count++}else combined.push({...step,count:1});return combined},[]),[result]);
- const transferCount=Math.max(0,groups.length-1);
+ const groups=useMemo(()=>boardingGroups(timing.events),[timing.events]);
+ const transferCount=groups.filter(group=>group.previousLine!==null&&group.previousLine!==group.line).length;
  const availableStops=spots.filter(s=>s.id!==from&&!stops.includes(s.id)),finalDestination=plannedDestinations.at(-1);
  const schedule=useMemo(()=>{const durationSeconds=durationMinutes*60,[hours,minutes]=planningTime.split(':').map(Number),selectedSeconds=(hours||0)*3600+(minutes||0)*60,nextOccurrence=notBefore=>{let candidate=Math.floor(notBefore/86400)*86400+selectedSeconds;if(candidate<notBefore)candidate+=86400;return candidate};if(planningMode==='arrive'){const arrival=nextOccurrence(simSeconds+durationSeconds);return{departure:arrival-durationSeconds,arrival}}const departure=planningMode==='depart'?nextOccurrence(simSeconds):simSeconds;return{departure,arrival:departure+durationSeconds}},[simSeconds,planningMode,planningTime,durationMinutes]);
  useEffect(()=>{if(!availableStops.some(s=>s.id===pendingStop))setPendingStop(availableStops[0]?.id||'')},[from,stops,pendingStop,availableStops]);
  useEffect(()=>{if(!roundTrip)return;setStops(activeRoutePlanner.createTour({origin:from,attractions:spots.filter(s=>!s.isHome&&!s.isSchool&&s.id!==from).map(s=>s.id),lines}));resetRide()},[plannerId]);
- useEffect(()=>{if(!clockRunning)return;const timer=setInterval(()=>setSimSeconds(seconds=>seconds+15),250);return()=>clearInterval(timer)},[clockRunning]);
+ // Fast-forward the simulation 4× while Bunny rides, keeping the clock and journey in sync.
+ useEffect(()=>{if(!clockRunning)return;const timer=setInterval(()=>setSimSeconds(seconds=>trip?Math.min(seconds+60,trip.departure+trip.durationSeconds):seconds+15),250);return()=>clearInterval(timer)},[clockRunning,trip]);
  useEffect(()=>{if(!trip)return;const next=Math.min(100,Math.max(0,(simSeconds-trip.departure)/trip.durationSeconds*100));setProgress(next);if(next>=100){setFrom(trip.destination);setStops([]);setRoundTrip(false);setTrip(null)}},[trip,simSeconds]);
- const bunnyPos=()=>{if(!trip||!result.length)return spots.find(s=>s.id===from)?.coord || [121.48,31.23];if(progress>=100)return spots.find(s=>s.id===finalDestination)?.coord || [121.48,31.23];let idx=Math.min(result.length-1,Math.floor(progress/100*result.length));let seg=result[idx]||result.at(-1),a=spots.find(s=>s.id===seg.from)?.coord||[121.48,31.23],b=spots.find(s=>s.id===seg.to)?.coord||[121.48,31.23],local=(progress/100*result.length)%1;return[a[0]+(b[0]-a[0])*local,a[1]+(b[1]-a[1])*local]};
- const bp=bunnyPos();
+ const journeyMinute=trip?trip.plan.departureMinute+(simSeconds-trip.departure)/60:plan.departureMinute;
+ const {event:rideEvent,coord:bp}=journeyPosition(trip?timing.events:[],journeyMinute,spots,from);
+ const currentGroup=trip?groups.find(group=>journeyMinute>=group.start-group.wait&&journeyMinute<group.end):null;
+ const nextGroup=trip?groups.find(group=>group.start>journeyMinute&&group!==currentGroup):null;
+ const spotName=id=>spots.find(spot=>spot.id===id)?.name||id;
+ const lineName=id=>lines.find(line=>line.id===id)?.name||id;
+ const rideLabel=rideEvent?.type==='ride'?`On ${lineName(rideEvent.line)}`:
+  rideEvent?.type==='wait'?`${currentGroup?.previousLine&&currentGroup.previousLine!==currentGroup.line?'Transfer · ':''}Waiting for ${lineName(rideEvent.line)}`:
+  rideEvent?.type==='visit'?`Visiting ${spotName(rideEvent.to)}`:'Walking to the bus stop';
  const resetRide=()=>{setTrip(null);setProgress(0)};
  const addStop=id=>{if(!id||id===from)return;setStops(s=>s.includes(id)?s:[...s,id]);resetRide()};
  const removeStop=index=>{setStops(s=>s.filter((_,i)=>i!==index));resetRide()};
@@ -225,7 +255,7 @@ function App(){
  const changeStart=id=>{setFrom(id);setStops(current=>roundTrip?activeRoutePlanner.createTour({origin:id,attractions:spots.filter(s=>!s.isHome&&!s.isSchool&&s.id!==id).map(s=>s.id),lines}):current.filter(stop=>stop!==id));resetRide()};
  const planTrip=(start,end)=>{setFrom(start);setStops([end]);setRoundTrip(false);setTrip(null);setProgress(0);setTab('planner')};
  const toggleFullTour=()=>{if(roundTrip){setStops([]);setRoundTrip(false)}else{setStops(activeRoutePlanner.createTour({origin:from,attractions:spots.filter(s=>!s.isHome&&!s.isSchool&&s.id!==from).map(s=>s.id),lines}));setRoundTrip(true)}resetRide()};
- const startPlannedTrip=()=>{if(!durationMinutes||!finalDestination)return;setSimSeconds(schedule.departure);setProgress(0);setClockRunning(true);setTrip({departure:schedule.departure,durationSeconds:durationMinutes*60,destination:finalDestination})};
+ const startPlannedTrip=()=>{if(!durationMinutes||!finalDestination)return;setSimSeconds(schedule.departure);setProgress(0);setClockRunning(true);setTrip({departure:schedule.departure,durationSeconds:durationMinutes*60,destination:finalDestination,plan})};
  const [planningHour24,planningMinute]=planningTime.split(':').map(Number),planningHour12=planningHour24%12||12,planningPeriod=planningHour24>=12?'PM':'AM';
  const setPickerHour=value=>setPlanningTime(`${String(Number(value)%12+(planningPeriod==='PM'?12:0)).padStart(2,'0')}:${String(planningMinute).padStart(2,'0')}`),setPickerMinute=value=>setPlanningTime(`${String(planningHour24).padStart(2,'0')}:${value}`),setPickerPeriod=value=>setPlanningTime(`${String(planningHour24%12+(value==='PM'?12:0)).padStart(2,'0')}:${String(planningMinute).padStart(2,'0')}`);
  const dayOffset=Math.floor(simSeconds/86400),secondsToday=simSeconds%86400,simHour=Math.floor(secondsToday/3600),simMinute=Math.floor(secondsToday%3600/60),simDate=new Date(2026,7,31+dayOffset),timeLabel=`${simHour%12||12}:${String(simMinute).padStart(2,'0')}`,timePeriod=simHour>=12?'PM':'AM',dateLabel=simDate.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'}).toUpperCase(),isNight=simHour<6||simHour>=18;
@@ -244,16 +274,33 @@ function App(){
      <div className="itinerary-head"><label>YOUR ITINERARY</label><span>{stops.length} {stops.length===1?'stop':'stops'}</span></div>
      <div className="itinerary-list">{stops.length?<>{stops.map((id,i)=>{const s=spots.find(x=>x.id===id);return <div className="itinerary-stop" key={id}><b className="stop-order">{i+1}</b><div><strong>{s?.name||id}</strong><small>{s?.cn||''}</small></div><div className="stop-controls"><button onClick={()=>moveStop(i,-1)} disabled={i===0} aria-label={`Move ${s?.name||id} earlier`}><ChevronUp size={14}/></button><button onClick={()=>moveStop(i,1)} disabled={i===stops.length-1} aria-label={`Move ${s?.name||id} later`}><ChevronDown size={14}/></button><button className="remove-stop" onClick={()=>removeStop(i)} aria-label={`Remove ${s?.name||id}`}><Trash2 size={13}/></button></div></div>})}{roundTrip&&<div className="itinerary-stop return-stop"><b className="stop-order"><RotateCcw size={12}/></b><div><strong>Return to {spots.find(s=>s.id===from)?.name}</strong><small>Round trip complete</small></div><em>FINAL</em></div>}</>:<div className="empty-itinerary">Click an attraction or add one below.</div>}</div>
      <label><span className="dot end"/>ADD A STOP</label><div className="stop-adder"><select value={pendingStop} onChange={e=>setPendingStop(e.target.value)} disabled={!availableStops.length}>{availableStops.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select><button onClick={()=>addStop(pendingStop)} disabled={!pendingStop} aria-label="Add selected stop"><Plus size={17}/></button></div>
-     <button className="find" disabled={!stops.length||!result.length} onClick={startPlannedTrip}><Navigation size={17}/> Start {roundTrip?'full city tour':stops.length>1?`${stops.length}-stop trip`:'trip'}</button>
+     <button className="find" disabled={!!trip||!stops.length||!result.length} onClick={startPlannedTrip}><Navigation size={17}/> Start {roundTrip?'full city tour':stops.length>1?`${stops.length}-stop trip`:'trip'}</button>
     </div>
     <div className="route-head"><div><small>{stops.length>1?'MULTI-STOP JOURNEY':'QUICKEST JOURNEY'} · {activeRoutePlanner.name.toUpperCase()} PLANNER</small><h3>{result.length?`${durationMinutes} min`:stops.length?'You’re already here!':'Add your first stop'}</h3></div>{result.length>0&&<div className="journey-stats"><span>{result.length} {result.length===1?'hop':'hops'}</span><span>{transferCount} {transferCount===1?'change':'changes'}</span><span>{timing.waitMinutes} min waiting</span></div>}</div>
     {result.length>0&&<div className="schedule-preview"><div><span>DEPART</span><b>{formatScheduleTime(displaySchedule.departure)}</b><small>{scheduleDay(displaySchedule.departure)}</small></div><ArrowRight size={18}/><div><span>ARRIVE</span><b>{formatScheduleTime(displaySchedule.arrival)}</b><small>{scheduleDay(displaySchedule.arrival)}</small></div></div>}
-    <div className="steps">{groups.map((g,i)=>{const l=lines.find(x=>x.id===g.line),frequency=lineFrequency(g.line,lines);return <div className="step" key={`${g.line}-${g.from}-${g.to}-${i}`}><div className="route-badge" style={{background:l?.color||'#3b82f6'}}>{l?.id}</div><div><b>{l?.name}</b><span>{spots.find(s=>s.id===g.from)?.name} → {spots.find(s=>s.id===g.to)?.name}</span><small>{g.count} {g.count===1?'hop':'hops'} · every {frequency} min</small></div><em className={i?'change':'board'}>{i?'CHANGE':'BOARD'}</em></div>})}</div>
+    <div className="steps">{groups.map((g,i)=>{
+     const l=lines.find(x=>x.id===g.line),active=trip&&currentGroup===g,change=g.previousLine!==null&&g.previousLine!==g.line;
+     return <React.Fragment key={`${g.line}-${g.from}-${i}`}>
+      {i>0&&<div className={'transfer-instruction '+(active?'active':'')}><ArrowRight size={16}/><div><b>{change?`Transfer at ${spotName(g.from)}`:`Board again at ${spotName(g.from)}`}</b><span>{change?`${lineName(g.previousLine)} → ${lineName(g.line)}`:`Take the next ${lineName(g.line)} after your visit`}</span><small>{g.wait?`${g.wait} min wait`:'No scheduled wait'}</small></div></div>}
+      <div className={'step '+(active?'active-step':'')} aria-current={active?'step':undefined}>
+       <div className="route-badge" style={{background:l?.color||'#3b82f6'}}>{l?.id}</div>
+       <div><b>{l?.name}</b><span>{spotName(g.from)} → {spotName(g.to)}</span><small>{g.count} {g.count===1?'hop':'hops'} · every {lineFrequency(g.line,lines)} min</small></div>
+       <em className={active?'board':change?'change':'board'}>{active?(rideEvent?.type==='wait'?'WAITING':'ON BOARD'):change?'TRANSFER':i?'REBOARD':'BOARD'}</em>
+      </div>
+     </React.Fragment>;
+    })}</div>
    </aside>
    <section className="map-wrap">
-    <div className="map-top"><div className="map-title"><b>Shanghai</b><span>上海市 · {dateLabel} · 26°C</span></div><div className="map-tools"><div className="sim-clock" aria-live="polite"><Clock size={17}/><div><b>{timeLabel} <em>{timePeriod}</em></b><span>SIMULATED · 60×</span></div><button className="clock-toggle" onClick={()=>setClockRunning(running=>!running)} aria-label={clockRunning?'Pause simulated time':'Resume simulated time'} title={clockRunning?'Pause time':'Resume time'}>{clockRunning?<Pause size={14}/>:<Play size={14}/>}</button></div><button><LocateFixed size={16}/> Center map</button></div></div>
+    <div className="map-top"><div className="map-title"><b>Shanghai</b><span>上海市 · {dateLabel} · 26°C</span></div><div className="map-tools"><div className="sim-clock" aria-live="polite"><Clock size={17}/><div><b>{timeLabel} <em>{timePeriod}</em></b><span>SIMULATED · {trip?240:60}×</span></div><button className="clock-toggle" onClick={()=>setClockRunning(running=>!running)} aria-label={clockRunning?'Pause simulated time':'Resume simulated time'} title={clockRunning?'Pause time':'Resume time'}>{clockRunning?<Pause size={14}/>:<Play size={14}/>}</button></div><button><LocateFixed size={16}/> Center map</button></div></div>
     <div className={'map '+(isNight?'night-time':'')}>
-     <MapScene from={from} targets={stops} bunnyCoord={bp} trip={trip} progress={progress} simSeconds={simSeconds} onSelect={setSelected} spots={spots} lines={lines}/>
+     <MapScene from={from} targets={stops} bunnyCoord={bp} rideEvent={rideEvent} rideLabel={rideLabel} groups={groups} trip={trip} progress={progress} simSeconds={simSeconds} onSelect={setSelected} spots={spots} lines={lines}/>
+     {trip&&<div className="ride-status" role="status" aria-live="polite">
+      <div className="ride-status-icon" style={{background:lines.find(line=>line.id===rideEvent?.line)?.color||'#285f52'}}>{rideEvent?.type==='ride'?<BusFront size={26}/>:rideEvent?.type==='wait'?<Clock size={26}/>:<MapPin size={26}/>}</div>
+      <div><small>BUNNY’S JOURNEY · {Math.round(progress)}%</small><b>{rideLabel}</b>
+       <span>{rideEvent?.type==='ride'?`Next stop: ${spotName(rideEvent.to)}`:rideEvent?.type==='wait'?`At ${spotName(rideEvent.from)} · boards in ${Math.max(0,Math.ceil(rideEvent.end-journeyMinute))} min`:rideEvent?.type==='visit'?`Back to the bus in ${Math.max(0,Math.ceil(rideEvent.end-journeyMinute))} min`:'Heading to the first bus stop'}</span>
+       {nextGroup&&<p>{currentGroup&&currentGroup.line!==nextGroup.line?`Next transfer: ${spotName(nextGroup.from)} · ${lineName(nextGroup.line)}`:`Next bus: ${lineName(nextGroup.line)} at ${spotName(nextGroup.from)}`}</p>}
+      </div>
+     </div>}
      <div className="legend"><b>BUS NETWORK</b>{lines.map(l=><span key={l.id}><i style={{background:l.color}}/>{l.name}</span>)}</div>
     </div>
    </section>
