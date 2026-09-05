@@ -38,10 +38,31 @@ function planTrip({origin,destinations,lines}){
  });
 }
 
+function scoreLeg(steps){
+ return steps.reduce((cost,step,index)=>cost+1+(index&&steps[index-1].line!==step.line?3:0),0);
+}
+
+function createTour({origin,attractions,lines}){
+ const remaining=[...new Set(attractions)].filter(id=>id!==origin),tour=[];
+ let current=origin;
+ while(remaining.length){
+  const ranked=remaining.map((destination,index)=>{
+   const steps=planLeg(current,destination,lines);
+   return{destination,index,cost:steps.length?scoreLeg(steps):Number.POSITIVE_INFINITY};
+  }).sort((a,b)=>a.cost-b.cost||a.index-b.index);
+  if(!Number.isFinite(ranked[0].cost)){tour.push(...remaining);break}
+  current=ranked[0].destination;
+  tour.push(current);
+  remaining.splice(remaining.indexOf(current),1);
+ }
+ return tour;
+}
+
 export const chatgptPlanner=Object.freeze({
  id:'chatgpt',
  name:'ChatGPT',
  planTrip,
+ createTour,
 });
 
 export default chatgptPlanner;
