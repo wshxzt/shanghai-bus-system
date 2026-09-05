@@ -847,6 +847,7 @@
   padding: 8px 12px;
   border-radius: 10px;
   margin-bottom: 14px;
+}
 
 .stat-pills div {
   flex: 1;
@@ -1139,7 +1140,6 @@
   background: #eff6ff;
   font-weight: 700;
 }
-
 
 
 

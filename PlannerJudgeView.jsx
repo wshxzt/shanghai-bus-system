@@ -70,6 +70,54 @@ export function getPresetDatasets(defaultSpots, defaultLines) {
 }
 
 // --- Benchmark Runner Engine ---
+const JUDGE_TRANSFER_PENALTY = 3;
+
+function isLegalStep(step, lines) {
+  const line = lines.find(candidate => candidate.id === step.line);
+  if (!line) return false;
+  return line.stops.some((stop, index) => {
+    const next = line.stops[index + 1];
+    return (stop === step.from && next === step.to) || (stop === step.to && next === step.from);
+  });
+}
+
+function evaluateTrip(trip, expectedOrigin, expectedDestinations, lines) {
+  const notes = [];
+  let current = expectedOrigin;
+  let totalHops = 0;
+  let totalTransfers = 0;
+
+  if (!Array.isArray(trip) || trip.length !== expectedDestinations.length) {
+    notes.push(`Expected ${expectedDestinations.length} legs, received ${trip?.length ?? 0}`);
+  }
+
+  expectedDestinations.forEach((destination, legIndex) => {
+    const leg = trip?.[legIndex];
+    if (!leg) return;
+    if (leg.from !== current || leg.to !== destination) notes.push(`Leg ${legIndex + 1} endpoints do not match`);
+
+    const steps = Array.isArray(leg.steps) ? leg.steps : [];
+    if (current !== destination && steps.length === 0) notes.push(`Leg ${legIndex + 1} has no route`);
+    steps.forEach((step, stepIndex) => {
+      const expectedFrom = stepIndex ? steps[stepIndex - 1].to : current;
+      if (step.from !== expectedFrom) notes.push(`Leg ${legIndex + 1} is discontinuous at hop ${stepIndex + 1}`);
+      if (!isLegalStep(step, lines)) notes.push(`Leg ${legIndex + 1} uses an invalid bus edge`);
+      if (stepIndex && steps[stepIndex - 1].line !== step.line) totalTransfers++;
+    });
+    if (steps.length && steps.at(-1).to !== destination) notes.push(`Leg ${legIndex + 1} ends at the wrong stop`);
+    totalHops += steps.length;
+    current = destination;
+  });
+
+  return {
+    isCorrect: notes.length === 0,
+    totalHops,
+    totalTransfers,
+    totalCost: totalHops + totalTransfers * JUDGE_TRANSFER_PENALTY,
+    notes,
+  };
+}
+
 export function runPlannerBenchmark(datasetSpots, datasetLines) {
   const plannerIds = Object.keys(routePlanners);
   const testResults = [];
@@ -148,6 +196,42 @@ export function runPlannerBenchmark(datasetSpots, datasetLines) {
     }
   ];
 
+  const originIndexes = [...new Set([
+    0,
+    Math.floor(datasetSpots.length / 4),
+    Math.floor(datasetSpots.length / 2),
+    Math.floor(datasetSpots.length * 3 / 4),
+  ])].filter(index => datasetSpots[index]);
+
+  originIndexes.forEach((originIndex, sampleIndex) => {
+    [Math.floor(datasetSpots.length / 3), Math.floor(datasetSpots.length * 2 / 3)].forEach((offset, offsetIndex) => {
+      const destinationIndex = (originIndex + Math.max(1, offset)) % datasetSpots.length;
+      scenarios.push({
+        id: `sample_leg_${sampleIndex}_${offsetIndex}`,
+        name: `Sampled Cross-City Leg ${sampleIndex * 2 + offsetIndex + 1}`,
+        desc: 'A deterministic origin/destination sample that reduces source-order bias.',
+        getParams: spots => ({ origin: spots[originIndex].id, destination: spots[destinationIndex].id, type: 'leg' }),
+      });
+    });
+
+    [3, 5].forEach(size => {
+      scenarios.push({
+        id: `sample_tour_${sampleIndex}_${size}`,
+        name: `Sampled ${size}-Stop Tour from Zone ${sampleIndex + 1}`,
+        desc: 'A deterministic round trip starting from a different part of the network.',
+        getParams: spots => {
+          const origin = spots[originIndex].id;
+          const attractions = [];
+          for (let step = 1; attractions.length < Math.min(size, spots.length - 1); step++) {
+            const candidate = spots[(originIndex + step * 3) % spots.length].id;
+            if (candidate !== origin && !attractions.includes(candidate)) attractions.push(candidate);
+          }
+          return { origin, attractions, type: 'tour' };
+        },
+      });
+    });
+  });
+
   scenarios.forEach(scen => {
     const params = scen.getParams(datasetSpots, datasetLines);
     if (!params) return;
@@ -162,10 +246,10 @@ export function runPlannerBenchmark(datasetSpots, datasetLines) {
 
       try {
         if (params.type === 'leg') {
-          result = planner.planTrip({ origin: params.origin, destinations: [params.destination], lines });
+          result = planner.planTrip({ origin: params.origin, destinations: [params.destination], lines: datasetLines });
         } else {
-          const tour = planner.createTour({ origin: params.origin, attractions: params.attractions, lines });
-          const trip = planner.planTrip({ origin: params.origin, destinations: [...tour, params.origin], lines });
+          const tour = planner.createTour({ origin: params.origin, attractions: params.attractions, lines: datasetLines });
+          const trip = planner.planTrip({ origin: params.origin, destinations: [...tour, params.origin], lines: datasetLines });
           result = { tour, trip };
         }
       } catch (err) {
@@ -185,62 +269,30 @@ export function runPlannerBenchmark(datasetSpots, datasetLines) {
       } else if (params.type === 'leg') {
         const steps = result[0]?.steps || [];
         if (scen.expectedUnreachable) {
-          isCorrect = true;
-          validationNotes.push('Graceful fallback (0 steps found as expected)');
+          isCorrect = steps.length === 0;
+          validationNotes.push(isCorrect ? 'Graceful fallback (0 steps found as expected)' : 'Returned a route to an isolated destination');
         } else {
-          if (steps.length === 0) {
-            isCorrect = false;
-            validationNotes.push('No route steps found');
-          } else {
-            for (let i = 0; i < steps.length; i++) {
-              if (i > 0 && steps[i].from !== steps[i - 1].to) {
-                isCorrect = false;
-                validationNotes.push(`Discontinuous path at step ${i}`);
-              }
-            }
-            if (steps[0].from !== params.origin) {
-              isCorrect = false;
-              validationNotes.push(`Origin mismatch`);
-            }
-            if (steps[steps.length - 1].to !== params.destination) {
-              isCorrect = false;
-              validationNotes.push(`Destination mismatch`);
-            }
-          }
+          const evaluated = evaluateTrip(result, params.origin, [params.destination], datasetLines);
+          isCorrect = evaluated.isCorrect;
+          validationNotes.push(...evaluated.notes);
+          totalHops = evaluated.totalHops;
+          totalTransfers = evaluated.totalTransfers;
+          totalCost = evaluated.totalCost;
         }
-        totalHops = steps.length;
-        totalTransfers = steps.reduce((acc, step, idx) => acc + (idx > 0 && steps[idx - 1].line !== step.line ? 1 : 0), 0);
-        totalCost = totalHops + totalTransfers * (id === 'grok' ? 8 : 3);
       } else { // tour
         const { tour, trip } = result;
-        const allSteps = trip.flatMap(leg => leg.steps);
-        
+        const expected = [...new Set(params.attractions.filter(a => datasetSpots.some(s => s.id === a) && a !== params.origin))];
         const visited = new Set(tour);
-        const expected = new Set(params.attractions.filter(a => datasetSpots.some(s => s.id === a)));
-        
-        expected.forEach(att => {
-          if (!visited.has(att)) {
-            isCorrect = false;
-            validationNotes.push(`Missing attraction: ${att}`);
-          }
-        });
+        if (tour.length !== expected.length || visited.size !== tour.length) validationNotes.push('Tour contains duplicate or extra stops');
+        expected.forEach(att => { if (!visited.has(att)) validationNotes.push(`Missing attraction: ${att}`); });
+        tour.forEach(att => { if (!expected.includes(att)) validationNotes.push(`Unexpected attraction: ${att}`); });
 
-        let lastStop = params.origin;
-        trip.forEach((leg, legIdx) => {
-          if (leg.from !== lastStop) {
-            isCorrect = false;
-            validationNotes.push(`Leg ${legIdx} start mismatch`);
-          }
-          lastStop = leg.to;
-        });
-
-        totalHops = allSteps.length;
-        totalTransfers = allSteps.reduce((acc, step, idx) => acc + (idx > 0 && allSteps[idx - 1].line !== step.line ? 1 : 0), 0);
-        totalCost = totalHops + totalTransfers * 3;
-
-        if (id === 'claude' && scen.id === 'return_cost_accounting') {
-          validationNotes.push('Note: Claude omits return-to-origin cost in tourCost() formula');
-        }
+        const evaluated = evaluateTrip(trip, params.origin, [...tour, params.origin], datasetLines);
+        validationNotes.push(...evaluated.notes);
+        isCorrect = validationNotes.length === 0;
+        totalHops = evaluated.totalHops;
+        totalTransfers = evaluated.totalTransfers;
+        totalCost = evaluated.totalCost;
       }
 
       plannerOutputs[id] = {
@@ -262,6 +314,55 @@ export function runPlannerBenchmark(datasetSpots, datasetLines) {
   });
 
   return testResults;
+}
+
+export function summarizePlannerResults(benchmarkResults) {
+  const ids = Object.keys(routePlanners);
+  const summary = Object.fromEntries(ids.map(id => [id, {
+    name: routePlanners[id].name,
+    correctCount: 0,
+    totalTests: benchmarkResults.length,
+    wins: 0,
+    totalHops: 0,
+    totalTransfers: 0,
+    totalCost: 0,
+    totalDurationMs: 0,
+    qualityPoints: 0,
+  }]));
+
+  benchmarkResults.forEach(result => {
+    const correctOutputs = ids.map(id => ({ id, ...result.outputs[id] })).filter(output => output.isCorrect);
+    const bestCost = correctOutputs.length ? Math.min(...correctOutputs.map(output => output.totalCost)) : null;
+    correctOutputs.forEach(output => {
+      if (output.totalCost === bestCost) summary[output.id].wins++;
+    });
+
+    ids.forEach(id => {
+      const output = result.outputs[id];
+      const item = summary[id];
+      item.totalDurationMs += Number(output.durationMs) || 0;
+      if (!output.isCorrect) return;
+      item.correctCount++;
+      item.totalHops += output.totalHops;
+      item.totalTransfers += output.totalTransfers;
+      item.totalCost += output.totalCost;
+      item.qualityPoints += bestCost === 0 ? (output.totalCost === 0 ? 100 : 0) : bestCost / output.totalCost * 100;
+    });
+  });
+
+  ids.forEach(id => {
+    const item = summary[id];
+    const divisor = item.correctCount || 1;
+    item.correctRate = item.totalTests ? item.correctCount / item.totalTests * 100 : 0;
+    item.qualityScore = item.totalTests ? item.qualityPoints / item.totalTests : 0;
+    item.overallScore = item.correctRate * 0.7 + item.qualityScore * 0.3;
+    item.avgDurationMs = item.totalTests ? item.totalDurationMs / item.totalTests : 0;
+    item.avgHops = item.totalHops / divisor;
+    item.avgTransfers = item.totalTransfers / divisor;
+    item.avgCost = item.totalCost / divisor;
+  });
+
+  return summary;
 }
 
 // --- Main Component ---
@@ -320,26 +421,32 @@ export default function PlannerJudgeView({ defaultSpots, defaultLines, onUpdateB
       const planner = routePlanners[id];
       const start = performance.now();
       let steps = [];
+      let trip = [];
+      let tour = [];
 
       if (testDestinations.length === 1) {
-        const trip = planner.planTrip({ origin: startSpotId, destinations: testDestinations, lines: activeDataset.lines });
+        trip = planner.planTrip({ origin: startSpotId, destinations: testDestinations, lines: activeDataset.lines });
         steps = trip[0]?.steps || [];
       } else {
         // Multi-stop tour with random length
-        const tour = planner.createTour({ origin: startSpotId, attractions: testDestinations, lines: activeDataset.lines });
-        const trip = planner.planTrip({ origin: startSpotId, destinations: [...tour, startSpotId], lines: activeDataset.lines });
+        tour = planner.createTour({ origin: startSpotId, attractions: testDestinations, lines: activeDataset.lines });
+        trip = planner.planTrip({ origin: startSpotId, destinations: [...tour, startSpotId], lines: activeDataset.lines });
         steps = trip.flatMap(leg => leg.steps);
       }
       const duration = performance.now() - start;
-      const transfers = steps.reduce((acc, s, idx) => acc + (idx > 0 && steps[idx - 1].line !== s.line ? 1 : 0), 0);
+      const expectedDestinations = testDestinations.length === 1 ? testDestinations : [...tour, startSpotId];
+      const evaluated = evaluateTrip(trip, startSpotId, expectedDestinations, activeDataset.lines);
+      const expectedStops = new Set(testDestinations);
+      const tourIsComplete = testDestinations.length === 1 || (tour.length === expectedStops.size && new Set(tour).size === tour.length && tour.every(id => expectedStops.has(id)));
 
       customOutputs[id] = {
         name: planner.name,
         steps,
-        hops: steps.length,
-        transfers,
+        hops: evaluated.totalHops,
+        transfers: evaluated.totalTransfers,
+        cost: evaluated.totalCost,
         durationMs: duration.toFixed(2),
-        isValid: steps.length > 0 && steps[0].from === startSpotId,
+        isValid: evaluated.isCorrect && tourIsComplete,
       };
     });
 
@@ -374,48 +481,27 @@ export default function PlannerJudgeView({ defaultSpots, defaultLines, onUpdateB
     }
   };
 
-  // Summarize Scores per Planner
-  const plannerSummary = useMemo(() => {
-    const ids = Object.keys(routePlanners);
-    const summary = {};
-
-    ids.forEach(id => {
-      summary[id] = {
-        name: routePlanners[id].name,
-        correctCount: 0,
-        totalTests: benchmarkResults.length,
-        totalHops: 0,
-        totalTransfers: 0,
-        totalDurationMs: 0,
-      };
-    });
-
-    benchmarkResults.forEach(res => {
-      ids.forEach(id => {
-        const out = res.outputs[id];
-        if (out.isCorrect) summary[id].correctCount++;
-        summary[id].totalHops += out.totalHops;
-        summary[id].totalTransfers += out.totalTransfers;
-        summary[id].totalDurationMs += parseFloat(out.durationMs);
-      });
-    });
-
-    ids.forEach(id => {
-      const s = summary[id];
-      s.correctRate = Math.round((s.correctCount / s.totalTests) * 100);
-      s.avgDurationMs = (s.totalDurationMs / s.totalTests).toFixed(2);
-      s.avgHops = (s.totalHops / s.totalTests).toFixed(1);
-      s.avgTransfers = (s.totalTransfers / s.totalTests).toFixed(1);
-    });
-
-    return summary;
-  }, [benchmarkResults]);
-
-  const winner = {
-    id: 'grok',
-    name: 'Grok Planner',
-    reason: 'Best TSP tour optimization (Cheapest Insertion + 3-Opt) and aggressive bus transfer minimization (penalty = 8).'
-  };
+  const plannerSummary = useMemo(() => summarizePlannerResults(benchmarkResults), [benchmarkResults]);
+  const winner = useMemo(() => {
+    const ranked = Object.entries(plannerSummary).sort(([, a], [, b]) =>
+      b.overallScore - a.overallScore ||
+      b.correctRate - a.correctRate ||
+      b.qualityScore - a.qualityScore ||
+      b.wins - a.wins ||
+      a.avgCost - b.avgCost ||
+      a.avgDurationMs - b.avgDurationMs
+    );
+    const best = ranked[0];
+    if (!best) return { ids: [], name: 'No winner yet', reason: 'Run the benchmark to compare planners.' };
+    const tied = ranked.filter(([, item]) => best[1].overallScore - item.overallScore <= 0.5);
+    return {
+      ids: tied.map(([id]) => id),
+      name: tied.map(([, item]) => `${item.name} Planner`).join(' & '),
+      reason: tied.length > 1
+        ? `Statistical tie within 0.5 points across ${best[1].totalTests} tests; scores balance 70% correctness and 30% route quality.`
+        : `${best[1].overallScore.toFixed(1)}/100 balanced score: 70% correctness and 30% route quality across ${best[1].totalTests} tests.`,
+    };
+  }, [plannerSummary]);
 
   const startSpot = defaultSpots.find(s => s.id === startSpotId);
 
@@ -459,6 +545,25 @@ export default function PlannerJudgeView({ defaultSpots, defaultLines, onUpdateB
           <button className="btn-synth-generate" onClick={handleGenerateSyntheticRoutes}>
             <Sparkles size={16}/> 🎲 Generate Random Bus Routes & Update Map
           </button>
+        </div>
+
+        <div className="planner-scorecards">
+          {Object.entries(plannerSummary).map(([id, summary]) => (
+            <article key={id} className={`scorecard-card ${winner.ids.includes(id) ? 'winner-card' : ''}`}>
+              {winner.ids.includes(id) && <span className="winner-ribbon"><Trophy size={12}/> TOP SCORE</span>}
+              <div className="card-header">
+                <h3>{summary.name} Planner</h3>
+                <span className={`pass-badge ${summary.correctRate === 100 ? 'perfect' : 'warning'}`}>{summary.correctRate.toFixed(0)}% valid</span>
+              </div>
+              <div className="card-metrics">
+                <div className="metric-item"><small>Judge score</small><b>{summary.overallScore.toFixed(1)}</b></div>
+                <div className="metric-item"><small>Scenario wins</small><b>{summary.wins}/{summary.totalTests}</b></div>
+                <div className="metric-item"><small>Avg fair cost</small><b>{summary.avgCost.toFixed(1)}</b></div>
+                <div className="metric-item"><small>Avg latency</small><b>{summary.avgDurationMs.toFixed(2)} ms</b></div>
+              </div>
+              <div className="planner-verdict-text">All planners are judged with the same cost: one point per hop and three per in-leg transfer.</div>
+            </article>
+          ))}
         </div>
 
         {/* Random Length Test Route Generator */}
@@ -523,7 +628,7 @@ export default function PlannerJudgeView({ defaultSpots, defaultLines, onUpdateB
                 const lineDetails = activeDataset.lines;
 
                 return (
-                  <div key={id} className={`planner-result-card ${id === winner.id ? 'highlight-winner' : ''}`}>
+                  <div key={id} className={`planner-result-card ${winner.ids.includes(id) ? 'highlight-winner' : ''}`}>
                     <div className="card-top-bar">
                       <h3>{out.name} Planner</h3>
                       <span className={`status-pill ${out.isValid ? 'valid' : 'invalid'}`}>
@@ -534,6 +639,7 @@ export default function PlannerJudgeView({ defaultSpots, defaultLines, onUpdateB
                     <div className="stat-pills">
                       <div><small>Hops</small><b>{out.hops}</b></div>
                       <div><small>Transfers</small><b>{out.transfers}</b></div>
+                      <div><small>Fair cost</small><b>{out.cost}</b></div>
                       <div><small>Latency</small><b>{out.durationMs} ms</b></div>
                     </div>
 
@@ -610,4 +716,3 @@ export default function PlannerJudgeView({ defaultSpots, defaultLines, onUpdateB
     </section>
   );
 }
-
