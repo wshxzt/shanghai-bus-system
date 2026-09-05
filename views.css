@@ -494,7 +494,11 @@
 
 .judge-results-table th.col-planner {
   text-align: center;
-  width: 22%;
+  width: 16%;
+}
+
+.judge-results-table th.col-why {
+  width: 26%;
 }
 
 .judge-results-table td {
@@ -533,7 +537,8 @@
 }
 
 .cell-planner-result.winner-cell {
-  outline: 2px solid #f59e0b;
+  background: #e7f6ee;
+  outline: 2px solid #2f9e6e;
   outline-offset: -2px;
 }
 
@@ -541,8 +546,8 @@
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  background: #fef3c7;
-  color: #92400e;
+  background: #c8edd8;
+  color: #176b45;
   font-size: 10px;
   font-weight: 800;
   padding: 1px 6px;
@@ -571,7 +576,12 @@
 }
 
 .cell-planner-result.pass {
-  background: #f0fdf4;
+  background: #fff6d6;
+}
+
+.cell-planner-result.pass.winner-cell,
+.cell-planner-result.winner-cell {
+  background: #e7f6ee;
 }
 
 .cell-planner-result.fail {
@@ -603,6 +613,32 @@
   border-radius: 4px;
   border: 1px solid #fef3c7;
 }
+
+.cell-why {
+  text-align: left;
+  min-width: 220px;
+}
+
+.cell-why p {
+  margin: 0 0 7px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #475569;
+}
+
+.cell-why p:last-child {
+  margin-bottom: 0;
+}
+
+.cell-why b {
+  display: inline-block;
+  min-width: 58px;
+  margin-right: 4px;
+}
+
+.cell-why .why-win b { color: #176b45; }
+.cell-why .why-loss b { color: #a16207; }
+.cell-why .why-fail b { color: #b91c1c; }
 
 /* Report Section */
 .judge-report-section {

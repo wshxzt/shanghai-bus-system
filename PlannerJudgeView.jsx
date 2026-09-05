@@ -253,8 +253,102 @@ export function judgeTestRoutes(testRoutes, lines) {
     const fastestIds = bestTime === null ? [] : validIds.filter(id => outputs[id].timeMinutes === bestTime);
     const bestTransfers = fastestIds.length ? Math.min(...fastestIds.map(id => outputs[id].transfers)) : null;
     const winners = bestTransfers === null ? [] : fastestIds.filter(id => outputs[id].transfers === bestTransfers);
-    return { route, outputs, bestTime, bestTransfers, winners };
+    return { route, outputs, bestTime, bestTransfers, winners, comments: explainRouteOutcomes(route, outputs, winners) };
   });
+}
+
+function sameTour(a = [], b = []) {
+  return a.length === b.length && a.every((id, index) => id === b[index]);
+}
+
+function reversedTour(a = [], b = []) {
+  return sameTour(a, [...b].reverse());
+}
+
+function outcomeLabel(id, winners, isValid) {
+  if (!isValid) return 'Loss';
+  if (!winners.includes(id)) return 'Loss';
+  return winners.length > 1 ? 'Tie' : 'Win';
+}
+
+// Plain-language win/loss notes tied to how each planner actually searches:
+// ChatGPT = nearest-neighbor + 2-opt (hop cost, includes return) then Pareto A*.
+// Claude = nearest-neighbor + 2-opt (hop cost, skips return) then single-label Dijkstra.
+// Grok = insertion + 3-opt and 2-opt, then times both directions before Pareto A*.
+function explainRouteOutcomes(route, outputs, winners) {
+  const oneStop = route.destinations.length === 1;
+  const chatgptTour = outputs.chatgpt?.tour || [];
+  const claudeTour = outputs.claude?.tour || [];
+  const grokTour = outputs.grok?.tour || [];
+  const bestTime = winners.length ? outputs[winners[0]].timeMinutes : null;
+  const bestTransfers = winners.length ? outputs[winners[0]].transfers : null;
+
+  return Object.fromEntries(Object.keys(routePlanners).map(id => {
+    const out = outputs[id];
+    const label = outcomeLabel(id, winners, out.isValid);
+    if (!out.isValid) return [id, `${label} — no legal path`];
+
+    if (oneStop) {
+      if (label === 'Loss' && id === 'claude' && bestTime !== null && out.timeMinutes > bestTime) {
+        return [id, `${label} — Dijkstra kept the first arrival at each stop; A* found a faster connection`];
+      }
+      if (label === 'Loss' && id === 'claude' && out.timeMinutes === bestTime && out.transfers > bestTransfers) {
+        return [id, `${label} — same arrival; single-label Dijkstra used more line changes`];
+      }
+      if (label === 'Loss') return [id, `${label} — one-stop timetable search was slower on this departure`];
+      if (id === 'claude') return [id, `${label} — one-stop Dijkstra; visit order unused`];
+      return [id, `${label} — one-stop Pareto A*; visit order unused`];
+    }
+
+    const tour = out.tour || [];
+    if (id === 'grok') {
+      if (label === 'Loss' && !sameTour(tour, chatgptTour) && !reversedTour(tour, chatgptTour)) {
+        return [id, `${label} — timed 3-opt/2-opt still slower than ChatGPT's lower-penalty 2-opt order`];
+      }
+      if (label === 'Loss') return [id, `${label} — this visit order waited longer on the real timetable`];
+      if (reversedTour(tour, chatgptTour) && !sameTour(tour, chatgptTour)) {
+        return [id, label === 'Tie'
+          ? `${label} — reverse of ChatGPT's 2-opt cycle, same clock`
+          : `${label} — same cycle as 2-opt, but timed the reverse and rode it the faster way`];
+      }
+      if (!sameTour(tour, chatgptTour) && !sameTour(tour, claudeTour)) {
+        return [id, `${label} — insertion + 3-opt, then picked the direction that finishes sooner on this departure`];
+      }
+      if (label === 'Tie') return [id, `${label} — same visit order as another planner; both use timetable search`];
+      return [id, `${label} — same order, fewer changes because lastLine survives sightseeing`];
+    }
+
+    if (id === 'chatgpt') {
+      if (label === 'Loss' && reversedTour(tour, grokTour)) {
+        return [id, `${label} — 2-opt on hop cost kept this direction; Grok timed the reverse`];
+      }
+      if (label === 'Loss' && !sameTour(tour, grokTour)) {
+        return [id, `${label} — greedy nearest-neighbor + 2-opt sat longer for buses than Grok's timed tour`];
+      }
+      if (label === 'Loss') return [id, `${label} — same 2-opt order, but this path waited more`];
+      if (label === 'Tie' && sameTour(tour, grokTour)) {
+        return [id, `${label} — nearest-neighbor + 2-opt matched Grok's order; same A* clock`];
+      }
+      if (label === 'Tie') return [id, `${label} — different 2-opt order, same arrival`];
+      if (!sameTour(tour, grokTour)) {
+        return [id, `${label} — 2-opt hop-cost order lined up better with this departure`];
+      }
+      return [id, `${label} — Pareto A* with lastLine on this 2-opt tour`];
+    }
+
+    if (label === 'Loss' && !sameTour(tour, chatgptTour) && !sameTour(tour, grokTour)) {
+      return [id, `${label} — 2-opt scored hops only and skipped the ride home, so the order was weaker`];
+    }
+    if (label === 'Loss' && bestTime !== null && out.timeMinutes > bestTime) {
+      return [id, `${label} — same-style 2-opt order, but single-label Dijkstra was slower`];
+    }
+    if (label === 'Loss' && out.transfers > bestTransfers) {
+      return [id, `${label} — same arrival; dwell clears its line so the judge counted extra transfers`];
+    }
+    if (label === 'Loss') return [id, `${label} — nearest-neighbor + 2-opt without a return-home cost`];
+    if (label === 'Tie') return [id, `${label} — this 2-opt order matched the best clock`];
+    return [id, `${label} — Dijkstra found the fastest clock on this 2-opt tour`];
+  }));
 }
 
 // Roll every route's outcome up into one easy-to-read number per planner:
@@ -591,6 +685,7 @@ export default function PlannerJudgeView({ defaultSpots, defaultLines, onUpdateB
                   {Object.keys(routePlanners).map(id => (
                     <th key={id} className="col-planner">{routePlanners[id].name}</th>
                   ))}
+                  <th className="col-why">Why</th>
                 </tr>
               </thead>
               <tbody>
@@ -630,10 +725,21 @@ export default function PlannerJudgeView({ defaultSpots, defaultLines, onUpdateB
                             </td>
                           );
                         })}
+                        <td className="cell-why">
+                          {Object.keys(routePlanners).map(id => {
+                            const isWinner = jr.winners.includes(id);
+                            const whyClass = !jr.outputs[id].isValid ? 'why-fail' : isWinner ? 'why-win' : 'why-loss';
+                            return (
+                              <p key={id} className={whyClass}>
+                                <b>{routePlanners[id].name}</b> {jr.comments[id]}
+                              </p>
+                            );
+                          })}
+                        </td>
                       </tr>
                       {isOpen && (
                         <tr className="judge-detail-row">
-                          <td colSpan={2 + Object.keys(routePlanners).length}>
+                          <td colSpan={3 + Object.keys(routePlanners).length}>
                             <RouteDetailPanel
                               route={jr.route}
                               outputs={jr.outputs}
