@@ -407,7 +407,7 @@
 
 .card-metrics {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 12px;
   margin-bottom: 16px;
   background: #f8fafc;
@@ -530,6 +530,44 @@
   text-align: center;
   background: #fafafa;
   border-radius: 8px;
+}
+
+.cell-planner-result.winner-cell {
+  outline: 2px solid #f59e0b;
+  outline-offset: -2px;
+}
+
+.mini-winner-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: #fef3c7;
+  color: #92400e;
+  font-size: 10px;
+  font-weight: 800;
+  padding: 1px 6px;
+  border-radius: 10px;
+  margin-left: 6px;
+}
+
+.judge-table-row {
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.judge-table-row:hover {
+  background: #f8fafc;
+}
+
+.judge-detail-row td {
+  padding: 0 16px 20px;
+  background: #f8fafc;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.judge-detail-panel {
+  margin-bottom: 0;
+  padding-top: 4px;
 }
 
 .cell-planner-result.pass {
@@ -839,6 +877,13 @@
 
 .status-pill.valid { background: #dcfce7; color: #15803d; }
 .status-pill.invalid { background: #fee2e2; color: #b91c1c; }
+
+.schedule-line {
+  font-size: 12px;
+  color: #64748b;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
 
 .stat-pills {
   display: flex;

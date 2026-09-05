@@ -1,10 +1,12 @@
 import React, { useState, useMemo, useEffect } from 'react';
-import { 
-  Trophy, ShieldCheck, Zap, Play, RefreshCw, 
+import {
+  Trophy, ShieldCheck, Zap, Play, RefreshCw,
   CheckCircle2, XCircle, BarChart3, Settings2, Sparkles,
-  Compass, ArrowRight, MapPin, BusFront, AlertCircle, Layers, Dices
+  Compass, ArrowRight, MapPin, BusFront, AlertCircle, Layers, Dices,
+  Info, ListChecks, Award, ChevronDown, ChevronUp
 } from 'lucide-react';
 import { routePlanners } from './route-planners/index.js';
+import { simulateTripTiming } from './schedule.js';
 
 // --- Bus Route Generator (Keeps original attraction names 100% intact!) ---
 export function generateRandomBusRoutes(spots, lineCount = 8) {
@@ -70,7 +72,23 @@ export function getPresetDatasets(defaultSpots, defaultLines) {
 }
 
 // --- Benchmark Runner Engine ---
-const JUDGE_TRANSFER_PENALTY = 3;
+// Trip time is graded with the real timeline simulation from schedule.js
+// (shared with the Claude planner and the live trip screen): it starts from
+// an actual departure time and, for every bus boarded, waits for that
+// specific line's next real departure, then adds sightseeing dwell time at
+// every stop visited. This matters because dwelling at a stop, or catching
+// an infrequent line, pushes back the clock and can change how long you
+// wait at the NEXT transfer - a flat "N minutes per hop" estimate can't see
+// that.
+const SERVICE_START_MINUTE = 6 * 60; // earliest randomized test departure: 06:00
+const SERVICE_END_MINUTE = 21 * 60; // latest randomized test departure: 21:00
+
+function formatClock(totalMinutes) {
+  const normalized = ((Math.round(totalMinutes) % 1440) + 1440) % 1440;
+  const hour = Math.floor(normalized / 60);
+  const minute = normalized % 60;
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
 
 function isLegalStep(step, lines) {
   const line = lines.find(candidate => candidate.id === step.line);
@@ -113,256 +131,259 @@ function evaluateTrip(trip, expectedOrigin, expectedDestinations, lines) {
     isCorrect: notes.length === 0,
     totalHops,
     totalTransfers,
-    totalCost: totalHops + totalTransfers * JUDGE_TRANSFER_PENALTY,
     notes,
   };
 }
 
-export function runPlannerBenchmark(datasetSpots, datasetLines) {
-  const plannerIds = Object.keys(routePlanners);
-  const testResults = [];
-
-  const scenarios = [
-    {
-      id: 'direct_leg',
-      name: '1. Direct Line Single Hop',
-      desc: 'Tests basic leg planning on a direct single-bus line without transfers.',
-      getParams: (spots, lines) => {
-        const line = lines[0];
-        if (!line || line.stops.length < 2) return null;
-        return { origin: line.stops[0], destination: line.stops[Math.min(3, line.stops.length - 1)], type: 'leg' };
-      }
-    },
-    {
-      id: 'transfer_tradeoff',
-      name: '2. Multi-Hop / Transfer Routing',
-      desc: 'Tests transfer penalty handling: preference between staying on one bus vs transferring.',
-      getParams: (spots, lines) => {
-        return { origin: spots[0].id, destination: spots[Math.min(4, spots.length - 1)].id, type: 'leg' };
-      }
-    },
-    {
-      id: 'short_tour',
-      name: '3. Short Attraction Tour (3 Stops)',
-      desc: 'Evaluates TSP round-trip tour ordering for 3 attractions returning to origin.',
-      getParams: (spots, lines) => {
-        const avail = spots.filter(s => s.id !== spots[0].id).map(s => s.id);
-        const origin = spots[0].id;
-        const attractions = avail.slice(0, Math.min(3, avail.length));
-        return { origin, attractions, type: 'tour' };
-      }
-    },
-    {
-      id: 'medium_tour',
-      name: '4. Medium Attraction Tour (5 Stops)',
-      desc: 'Evaluates TSP round-trip optimization efficiency on 5 attractions.',
-      getParams: (spots, lines) => {
-        const avail = spots.filter(s => s.id !== spots[0].id).map(s => s.id);
-        const origin = spots[0].id;
-        const attractions = avail.slice(0, Math.min(5, avail.length));
-        return { origin, attractions, type: 'tour' };
-      }
-    },
-    {
-      id: 'full_city_tour',
-      name: '5. Full City Tour (All Attractions)',
-      desc: 'Large TSP tour optimization across all major spots in the network.',
-      getParams: (spots, lines) => {
-        const avail = spots.filter(s => s.id !== spots[0].id).map(s => s.id);
-        const origin = spots[0].id;
-        return { origin, attractions: avail, type: 'tour' };
-      }
-    },
-    {
-      id: 'return_cost_accounting',
-      name: '6. Return-to-Origin Round Trip Accounting',
-      desc: 'Verifies whether the planner accounts for the final return leg back to origin.',
-      getParams: (spots, lines) => {
-        const origin = spots[0].id;
-        const attractions = spots.slice(1, Math.min(4, spots.length)).map(s => s.id);
-        return { origin, attractions, type: 'tour_return_check' };
-      }
-    },
-    {
-      id: 'unreachable_spot',
-      name: '7. Unreachable / Isolated Destination Test',
-      desc: 'Tests graceful fallback handling when a destination cannot be reached by bus.',
-      expectedUnreachable: true,
-      getParams: (spots, lines) => {
-        const origin = spots[0].id;
-        const unreach = spots.find(s => !lines.some(l => l.stops.includes(s.id)))?.id || 'non_existent_spot';
-        return { origin, destination: unreach, type: 'leg' };
-      }
+// Count line changes across the WHOLE trip (every leg's steps back to back),
+// the same way the main planner screen counts "changes" (see src.jsx: groups
+// / transferCount) - not per-leg, since a transfer at a leg boundary (e.g.
+// switching buses right as you reach the next attraction) is still a real
+// transfer for the rider.
+function countTransfers(steps) {
+  const groups = steps.reduce((combined, step) => {
+    const previous = combined.at(-1);
+    if (previous && previous.line === step.line && previous.to === step.from) {
+      previous.to = step.to;
+    } else {
+      combined.push({ ...step });
     }
-  ];
-
-  const originIndexes = [...new Set([
-    0,
-    Math.floor(datasetSpots.length / 4),
-    Math.floor(datasetSpots.length / 2),
-    Math.floor(datasetSpots.length * 3 / 4),
-  ])].filter(index => datasetSpots[index]);
-
-  originIndexes.forEach((originIndex, sampleIndex) => {
-    [Math.floor(datasetSpots.length / 3), Math.floor(datasetSpots.length * 2 / 3)].forEach((offset, offsetIndex) => {
-      const destinationIndex = (originIndex + Math.max(1, offset)) % datasetSpots.length;
-      scenarios.push({
-        id: `sample_leg_${sampleIndex}_${offsetIndex}`,
-        name: `Sampled Cross-City Leg ${sampleIndex * 2 + offsetIndex + 1}`,
-        desc: 'A deterministic origin/destination sample that reduces source-order bias.',
-        getParams: spots => ({ origin: spots[originIndex].id, destination: spots[destinationIndex].id, type: 'leg' }),
-      });
-    });
-
-    [3, 5].forEach(size => {
-      scenarios.push({
-        id: `sample_tour_${sampleIndex}_${size}`,
-        name: `Sampled ${size}-Stop Tour from Zone ${sampleIndex + 1}`,
-        desc: 'A deterministic round trip starting from a different part of the network.',
-        getParams: spots => {
-          const origin = spots[originIndex].id;
-          const attractions = [];
-          for (let step = 1; attractions.length < Math.min(size, spots.length - 1); step++) {
-            const candidate = spots[(originIndex + step * 3) % spots.length].id;
-            if (candidate !== origin && !attractions.includes(candidate)) attractions.push(candidate);
-          }
-          return { origin, attractions, type: 'tour' };
-        },
-      });
-    });
-  });
-
-  scenarios.forEach(scen => {
-    const params = scen.getParams(datasetSpots, datasetLines);
-    if (!params) return;
-
-    const plannerOutputs = {};
-
-    plannerIds.forEach(id => {
-      const planner = routePlanners[id];
-      const start = performance.now();
-      let result = null;
-      let error = null;
-
-      try {
-        if (params.type === 'leg') {
-          result = planner.planTrip({ origin: params.origin, destinations: [params.destination], lines: datasetLines });
-        } else {
-          const tour = planner.createTour({ origin: params.origin, attractions: params.attractions, lines: datasetLines });
-          const trip = planner.planTrip({ origin: params.origin, destinations: [...tour, params.origin], lines: datasetLines });
-          result = { tour, trip };
-        }
-      } catch (err) {
-        error = err.message;
-      }
-      const duration = performance.now() - start;
-
-      let isCorrect = true;
-      let totalHops = 0;
-      let totalTransfers = 0;
-      let totalCost = 0;
-      let validationNotes = [];
-
-      if (error) {
-        isCorrect = false;
-        validationNotes.push(`Error: ${error}`);
-      } else if (params.type === 'leg') {
-        const steps = result[0]?.steps || [];
-        if (scen.expectedUnreachable) {
-          isCorrect = steps.length === 0;
-          validationNotes.push(isCorrect ? 'Graceful fallback (0 steps found as expected)' : 'Returned a route to an isolated destination');
-        } else {
-          const evaluated = evaluateTrip(result, params.origin, [params.destination], datasetLines);
-          isCorrect = evaluated.isCorrect;
-          validationNotes.push(...evaluated.notes);
-          totalHops = evaluated.totalHops;
-          totalTransfers = evaluated.totalTransfers;
-          totalCost = evaluated.totalCost;
-        }
-      } else { // tour
-        const { tour, trip } = result;
-        const expected = [...new Set(params.attractions.filter(a => datasetSpots.some(s => s.id === a) && a !== params.origin))];
-        const visited = new Set(tour);
-        if (tour.length !== expected.length || visited.size !== tour.length) validationNotes.push('Tour contains duplicate or extra stops');
-        expected.forEach(att => { if (!visited.has(att)) validationNotes.push(`Missing attraction: ${att}`); });
-        tour.forEach(att => { if (!expected.includes(att)) validationNotes.push(`Unexpected attraction: ${att}`); });
-
-        const evaluated = evaluateTrip(trip, params.origin, [...tour, params.origin], datasetLines);
-        validationNotes.push(...evaluated.notes);
-        isCorrect = validationNotes.length === 0;
-        totalHops = evaluated.totalHops;
-        totalTransfers = evaluated.totalTransfers;
-        totalCost = evaluated.totalCost;
-      }
-
-      plannerOutputs[id] = {
-        result,
-        durationMs: duration.toFixed(2),
-        isCorrect,
-        totalHops,
-        totalTransfers,
-        totalCost,
-        notes: validationNotes.length ? validationNotes.join('; ') : 'Valid & Verified',
-      };
-    });
-
-    testResults.push({
-      scenario: scen,
-      params,
-      outputs: plannerOutputs
-    });
-  });
-
-  return testResults;
+    return combined;
+  }, []);
+  return Math.max(0, groups.length - 1);
 }
 
-export function summarizePlannerResults(benchmarkResults) {
-  const ids = Object.keys(routePlanners);
-  const summary = Object.fromEntries(ids.map(id => [id, {
+function spotName(spots, id) {
+  return spots.find(s => s.id === id)?.name || id;
+}
+
+// Build a batch of random point-to-point / multi-stop test routes from the
+// current attraction list. This is the ONE source of test cases: the same
+// batch is used to compute the score cards above AND the report table below,
+// so the two can never disagree about what was tested. Each route also gets
+// its own random departure time, so the batch as a whole exercises many
+// different schedule alignments (a planner that just got lucky/unlucky
+// waiting for one specific bus won't dominate the whole batch).
+export function generateTestRouteBatch(spots, count) {
+  const routes = [];
+  for (let i = 0; i < count; i++) {
+    const shuffled = [...spots].sort(() => Math.random() - 0.5);
+    const start = shuffled[0].id;
+    const length = 1 + Math.floor(Math.random() * 6); // 1 to 6 stops
+    const destinations = shuffled.slice(1, 1 + length).map(s => s.id);
+    const departureMinute = SERVICE_START_MINUTE + Math.floor(Math.random() * (SERVICE_END_MINUTE - SERVICE_START_MINUTE));
+    routes.push({ id: `route_${i}_${Math.random().toString(36).slice(2, 8)}`, start, destinations, departureMinute });
+  }
+  return routes;
+}
+
+export function describeTestRoute(route, spots) {
+  const startName = spotName(spots, route.start);
+  const destNames = route.destinations.map(id => spotName(spots, id));
+  return route.destinations.length === 1
+    ? `${startName} → ${destNames[0]}`
+    : `${startName} → ${destNames.join(' → ')} → ${startName}`;
+}
+
+// Run one planner against one test route and grade the result on the two
+// numbers a rider actually feels: total trip time and how many times they
+// have to change buses. The route must also be a legal, complete path.
+function runPlannerOnRoute(planner, route, lines) {
+  const { start, destinations, departureMinute } = route;
+  let trip = [];
+  let tour = [];
+  let error = null;
+  const t0 = performance.now();
+
+  try {
+    if (destinations.length === 1) {
+      trip = planner.planTrip({ origin: start, destinations, lines, departureMinute });
+    } else {
+      tour = planner.createTour({ origin: start, attractions: destinations, lines });
+      trip = planner.planTrip({ origin: start, destinations: [...tour, start], lines, departureMinute });
+    }
+  } catch (err) {
+    error = err.message;
+  }
+
+  const durationMs = performance.now() - t0;
+  const expectedDestinations = destinations.length === 1 ? destinations : [...tour, start];
+  const evaluated = evaluateTrip(trip, start, expectedDestinations, lines);
+  const expectedSet = new Set(destinations);
+  const tourIsComplete = destinations.length === 1 ||
+    (tour.length === expectedSet.size && new Set(tour).size === tour.length && tour.every(id => expectedSet.has(id)));
+
+  const notes = error ? [`Error: ${error}`] : [...evaluated.notes];
+  if (!error && !tourIsComplete) notes.push('Tour is missing or duplicates requested attractions');
+
+  const steps = Array.isArray(trip) ? trip.flatMap(leg => leg.steps || []) : [];
+  const hops = evaluated.totalHops;
+  const transfers = countTransfers(steps);
+  const timing = simulateTripTiming(trip, expectedDestinations, start, departureMinute, lines);
+
+  return {
+    isValid: !error && evaluated.isCorrect && tourIsComplete,
+    hops,
+    transfers,
+    timeMinutes: timing.timeMinutes,
+    waitMinutes: timing.waitMinutes,
+    rideMinutes: timing.rideMinutes,
+    dwellMinutes: timing.dwellMinutes,
+    arrivalMinute: departureMinute + timing.timeMinutes,
+    durationMs,
+    steps,
+    tour,
+    notes,
+  };
+}
+
+// Judge every planner against every route in the batch. Each row records,
+// per route, which planner(s) found the fastest *valid* trip - ties on time
+// are broken by whichever needs fewer bus changes. That is the entire basis
+// for every score shown anywhere on this page.
+export function judgeTestRoutes(testRoutes, lines) {
+  const plannerIds = Object.keys(routePlanners);
+  return testRoutes.map(route => {
+    const outputs = {};
+    plannerIds.forEach(id => {
+      outputs[id] = runPlannerOnRoute(routePlanners[id], route, lines);
+    });
+    const validIds = plannerIds.filter(id => outputs[id].isValid);
+    const bestTime = validIds.length ? Math.min(...validIds.map(id => outputs[id].timeMinutes)) : null;
+    const fastestIds = bestTime === null ? [] : validIds.filter(id => outputs[id].timeMinutes === bestTime);
+    const bestTransfers = fastestIds.length ? Math.min(...fastestIds.map(id => outputs[id].transfers)) : null;
+    const winners = bestTransfers === null ? [] : fastestIds.filter(id => outputs[id].transfers === bestTransfers);
+    return { route, outputs, bestTime, bestTransfers, winners };
+  });
+}
+
+// Roll every route's outcome up into one easy-to-read number per planner:
+// the percentage of routes where that planner tied-or-beat every other
+// planner on time (and transfers, as the tiebreak) while still producing a
+// legal route. No hidden weights.
+export function summarizeJudgeResults(judgeResults) {
+  const plannerIds = Object.keys(routePlanners);
+  const total = judgeResults.length;
+  const summary = Object.fromEntries(plannerIds.map(id => [id, {
+    id,
     name: routePlanners[id].name,
-    correctCount: 0,
-    totalTests: benchmarkResults.length,
+    total,
+    valid: 0,
     wins: 0,
-    totalHops: 0,
-    totalTransfers: 0,
-    totalCost: 0,
-    totalDurationMs: 0,
-    qualityPoints: 0,
+    sumTime: 0,
+    sumHops: 0,
+    sumTransfers: 0,
+    sumWait: 0,
+    sumDuration: 0,
   }]));
 
-  benchmarkResults.forEach(result => {
-    const correctOutputs = ids.map(id => ({ id, ...result.outputs[id] })).filter(output => output.isCorrect);
-    const bestCost = correctOutputs.length ? Math.min(...correctOutputs.map(output => output.totalCost)) : null;
-    correctOutputs.forEach(output => {
-      if (output.totalCost === bestCost) summary[output.id].wins++;
+  judgeResults.forEach(({ outputs, winners }) => {
+    plannerIds.forEach(id => {
+      const out = outputs[id];
+      summary[id].sumDuration += out.durationMs;
+      if (!out.isValid) return;
+      summary[id].valid++;
+      summary[id].sumTime += out.timeMinutes;
+      summary[id].sumHops += out.hops;
+      summary[id].sumTransfers += out.transfers;
+      summary[id].sumWait += out.waitMinutes;
     });
-
-    ids.forEach(id => {
-      const output = result.outputs[id];
-      const item = summary[id];
-      item.totalDurationMs += Number(output.durationMs) || 0;
-      if (!output.isCorrect) return;
-      item.correctCount++;
-      item.totalHops += output.totalHops;
-      item.totalTransfers += output.totalTransfers;
-      item.totalCost += output.totalCost;
-      item.qualityPoints += bestCost === 0 ? (output.totalCost === 0 ? 100 : 0) : bestCost / output.totalCost * 100;
-    });
+    winners.forEach(id => { summary[id].wins++; });
   });
 
-  ids.forEach(id => {
+  plannerIds.forEach(id => {
     const item = summary[id];
-    const divisor = item.correctCount || 1;
-    item.correctRate = item.totalTests ? item.correctCount / item.totalTests * 100 : 0;
-    item.qualityScore = item.totalTests ? item.qualityPoints / item.totalTests : 0;
-    item.overallScore = item.correctRate * 0.7 + item.qualityScore * 0.3;
-    item.avgDurationMs = item.totalTests ? item.totalDurationMs / item.totalTests : 0;
-    item.avgHops = item.totalHops / divisor;
-    item.avgTransfers = item.totalTransfers / divisor;
-    item.avgCost = item.totalCost / divisor;
+    item.validRate = total ? (item.valid / total) * 100 : 0;
+    item.winRate = total ? (item.wins / total) * 100 : 0;
+    item.avgTime = item.valid ? item.sumTime / item.valid : null;
+    item.avgHops = item.valid ? item.sumHops / item.valid : null;
+    item.avgTransfers = item.valid ? item.sumTransfers / item.valid : null;
+    item.avgWait = item.valid ? item.sumWait / item.valid : null;
+    item.avgLatency = total ? item.sumDuration / total : 0;
+    // Headline "Judge score": the share of the test batch this planner won outright.
+    item.score = item.winRate;
   });
 
   return summary;
+}
+
+// Renders the full planned path + per-planner stats for one test route, used
+// when a report-table row is expanded. Pulled out as its own function so the
+// "aggregate score" view and the "inspect one route" view share one renderer.
+function RouteDetailPanel({ route, outputs, winners, lines, spots }) {
+  return (
+    <div className="planner-outputs-comparison judge-detail-panel">
+      <div className="comparison-grid">
+        {Object.keys(routePlanners).map(id => {
+          const out = outputs[id];
+          const isWinner = winners.includes(id);
+          return (
+            <div key={id} className={`planner-result-card ${isWinner ? 'highlight-winner' : ''}`}>
+              <div className="card-top-bar">
+                <h3>{routePlanners[id].name} Planner</h3>
+                <span className={`status-pill ${out.isValid ? 'valid' : 'invalid'}`}>
+                  {out.isValid ? <><CheckCircle2 size={13}/> Valid Route</> : <><XCircle size={13}/> No Route</>}
+                </span>
+              </div>
+
+              {out.isValid && (
+                <div className="schedule-line">
+                  Depart {formatClock(route.departureMinute)} → Arrive {formatClock(out.arrivalMinute)}
+                </div>
+              )}
+
+              <div className="stat-pills">
+                <div><small>Total time</small><b>{out.timeMinutes} min</b></div>
+                <div><small>Waiting</small><b>{out.waitMinutes} min</b></div>
+                <div><small>Transfers</small><b>{out.transfers}</b></div>
+                <div><small>Hops</small><b>{out.hops}</b></div>
+              </div>
+
+              <div className="planner-full-path-container">
+                <small>FULL PLANNED PATH:</small>
+                {out.steps.length > 0 ? (
+                  <div className="planner-path-breadcrumbs">
+                    {(() => {
+                      const nodeIds = [out.steps[0].from, ...out.steps.map(s => s.to)];
+                      return nodeIds.map((spotId, nIdx) => {
+                        const spot = spots.find(s => s.id === spotId);
+                        const isStart = nIdx === 0;
+                        const isEnd = nIdx === nodeIds.length - 1;
+                        const stepPrev = nIdx > 0 ? out.steps[nIdx - 1] : null;
+                        const lineObj = stepPrev ? lines.find(l => l.id === stepPrev.line) : null;
+
+                        return (
+                          <React.Fragment key={nIdx}>
+                            {nIdx > 0 && (
+                              <span className="path-sep">
+                                <span className="mini-line-tag" style={{ background: lineObj?.color || '#3b82f6' }}>
+                                  {stepPrev?.line}
+                                </span>
+                                ➔
+                              </span>
+                            )}
+                            <span className={`path-spot-tag ${isStart ? 'start' : isEnd ? 'end' : ''}`}>
+                              {spot?.name || spotId}
+                            </span>
+                          </React.Fragment>
+                        );
+                      });
+                    })()}
+                  </div>
+                ) : (
+                  <div className="no-steps-text">No route found</div>
+                )}
+              </div>
+
+              {!out.isValid && out.notes.length > 0 && (
+                <div className="result-note">{out.notes.join('; ')}</div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 // --- Main Component ---
@@ -390,77 +411,6 @@ export default function PlannerJudgeView({ defaultSpots, defaultLines, onUpdateB
     }
   }, [activeDataset, defaultSpots]);
 
-  // Parameters for testing route (random length & destinations)
-  const [startSpotId, setStartSpotId] = useState('home');
-  const [testDestinations, setTestDestinations] = useState(['bund', 'pearl']);
-
-  // Generate Random Test Route with RANDOM LENGTH (1 to 6 stops!)
-  const handleGenerateRandomLengthTestRoute = () => {
-    const shuffled = [...defaultSpots].sort(() => Math.random() - 0.5);
-    const newStart = shuffled[0].id;
-    // Pick a random length from 1 to 6 stops
-    const randomLength = 1 + Math.floor(Math.random() * 6);
-    const newDests = shuffled.slice(1, 1 + randomLength).map(s => s.id);
-
-    setStartSpotId(newStart);
-    setTestDestinations(newDests);
-  };
-
-  const [benchmarkResults, setBenchmarkResults] = useState(() => runPlannerBenchmark(defaultSpots, activeDataset.lines));
-  const [customRunResults, setCustomRunResults] = useState(null);
-
-  // Execute evaluation across ChatGPT, Claude, and Grok for test route
-  const executeEvaluation = () => {
-    const bResults = runPlannerBenchmark(defaultSpots, activeDataset.lines);
-    setBenchmarkResults(bResults);
-
-    const plannerIds = Object.keys(routePlanners);
-    const customOutputs = {};
-
-    plannerIds.forEach(id => {
-      const planner = routePlanners[id];
-      const start = performance.now();
-      let steps = [];
-      let trip = [];
-      let tour = [];
-
-      if (testDestinations.length === 1) {
-        trip = planner.planTrip({ origin: startSpotId, destinations: testDestinations, lines: activeDataset.lines });
-        steps = trip[0]?.steps || [];
-      } else {
-        // Multi-stop tour with random length
-        tour = planner.createTour({ origin: startSpotId, attractions: testDestinations, lines: activeDataset.lines });
-        trip = planner.planTrip({ origin: startSpotId, destinations: [...tour, startSpotId], lines: activeDataset.lines });
-        steps = trip.flatMap(leg => leg.steps);
-      }
-      const duration = performance.now() - start;
-      const expectedDestinations = testDestinations.length === 1 ? testDestinations : [...tour, startSpotId];
-      const evaluated = evaluateTrip(trip, startSpotId, expectedDestinations, activeDataset.lines);
-      const expectedStops = new Set(testDestinations);
-      const tourIsComplete = testDestinations.length === 1 || (tour.length === expectedStops.size && new Set(tour).size === tour.length && tour.every(id => expectedStops.has(id)));
-
-      customOutputs[id] = {
-        name: planner.name,
-        steps,
-        hops: evaluated.totalHops,
-        transfers: evaluated.totalTransfers,
-        cost: evaluated.totalCost,
-        durationMs: duration.toFixed(2),
-        isValid: evaluated.isCorrect && tourIsComplete,
-      };
-    });
-
-    setCustomRunResults({
-      start: defaultSpots.find(s => s.id === startSpotId),
-      destinations: testDestinations.map(id => defaultSpots.find(s => s.id === id)).filter(Boolean),
-      outputs: customOutputs
-    });
-  };
-
-  useEffect(() => {
-    executeEvaluation();
-  }, [activeDataset, startSpotId, testDestinations]);
-
   // Handle difficulty selection change
   const handleDifficultyChange = (e) => {
     const val = Number(e.target.value);
@@ -481,42 +431,77 @@ export default function PlannerJudgeView({ defaultSpots, defaultLines, onUpdateB
     }
   };
 
-  const plannerSummary = useMemo(() => summarizePlannerResults(benchmarkResults), [benchmarkResults]);
+  // --- The judge's test batch: ONE set of random routes drives everything
+  // below - the score cards, the report table, and the report text. ---
+  const [testBatchSize, setTestBatchSize] = useState(20);
+  const [testRoutes, setTestRoutes] = useState(() => generateTestRouteBatch(defaultSpots, 20));
+  const [expandedRouteId, setExpandedRouteId] = useState(null);
+
+  const handleGenerateTestBatch = (size = testBatchSize) => {
+    setTestRoutes(generateTestRouteBatch(defaultSpots, size));
+    setExpandedRouteId(null);
+  };
+
+  const handleTestBatchSizeChange = (e) => {
+    const size = Number(e.target.value);
+    setTestBatchSize(size);
+    handleGenerateTestBatch(size);
+  };
+
+  // Judge every planner against every route in the batch (recomputed whenever
+  // the bus network or the batch of routes changes).
+  const judgeResults = useMemo(
+    () => judgeTestRoutes(testRoutes, activeDataset.lines),
+    [testRoutes, activeDataset]
+  );
+
+  const plannerSummary = useMemo(() => summarizeJudgeResults(judgeResults), [judgeResults]);
+
   const winner = useMemo(() => {
-    const ranked = Object.entries(plannerSummary).sort(([, a], [, b]) =>
-      b.overallScore - a.overallScore ||
-      b.correctRate - a.correctRate ||
-      b.qualityScore - a.qualityScore ||
-      b.wins - a.wins ||
-      a.avgCost - b.avgCost ||
-      a.avgDurationMs - b.avgDurationMs
+    const ranked = Object.values(plannerSummary).sort((a, b) =>
+      b.score - a.score ||
+      b.validRate - a.validRate ||
+      (a.avgTime ?? Infinity) - (b.avgTime ?? Infinity) ||
+      (a.avgTransfers ?? Infinity) - (b.avgTransfers ?? Infinity) ||
+      a.avgLatency - b.avgLatency
     );
     const best = ranked[0];
-    if (!best) return { ids: [], name: 'No winner yet', reason: 'Run the benchmark to compare planners.' };
-    const tied = ranked.filter(([, item]) => best[1].overallScore - item.overallScore <= 0.5);
+    if (!best || !best.total) {
+      return { ids: [], name: 'No data yet', reason: 'Generate a test batch to compare planners.' };
+    }
+    const tied = ranked.filter(item =>
+      Math.abs(best.score - item.score) < 0.01 &&
+      Math.abs(best.validRate - item.validRate) < 0.01 &&
+      Math.abs((best.avgTime ?? 0) - (item.avgTime ?? 0)) < 0.01 &&
+      Math.abs((best.avgTransfers ?? 0) - (item.avgTransfers ?? 0)) < 0.01
+    );
     return {
-      ids: tied.map(([id]) => id),
-      name: tied.map(([, item]) => `${item.name} Planner`).join(' & '),
+      ids: tied.map(item => item.id),
+      name: tied.map(item => `${item.name} Planner`).join(' & '),
       reason: tied.length > 1
-        ? `Statistical tie within 0.5 points across ${best[1].totalTests} tests; scores balance 70% correctness and 30% route quality.`
-        : `${best[1].overallScore.toFixed(1)}/100 balanced score: 70% correctness and 30% route quality across ${best[1].totalTests} tests.`,
+        ? `Tied: each won the fastest route on ${best.wins}/${best.total} random test routes (${best.score.toFixed(0)}%).`
+        : `Won the fastest valid route (ties broken by fewer transfers) on ${best.wins} of ${best.total} random test routes (${best.score.toFixed(0)}%).`,
     };
   }, [plannerSummary]);
 
-  const startSpot = defaultSpots.find(s => s.id === startSpotId);
+  const rankedSummary = useMemo(
+    () => Object.values(plannerSummary).sort((a, b) => b.score - a.score),
+    [plannerSummary]
+  );
 
   return (
     <section className="page-view judge-page">
       <div className="page-shell">
-        
+
         {/* Header Hero */}
         <div className="page-hero judge-hero">
           <div>
             <small className="page-kicker">AUTOMATED ROUTE EVALUATOR</small>
             <h1>Trip Planner<br/>Judge & Benchmark</h1>
             <p>
-              Automate test route generation across original Shanghai attractions (reflected on map), 
-              and evaluate <b>ChatGPT</b>, <b>Claude</b>, and <b>Grok</b> algorithms side-by-side.
+              Generate a bus network and a batch of random test routes across the original Shanghai
+              attractions, then judge <b>ChatGPT</b>, <b>Claude</b>, and <b>Grok</b> against the exact
+              same routes side-by-side.
             </p>
           </div>
           <div className="judge-badge-box">
@@ -529,7 +514,7 @@ export default function PlannerJudgeView({ defaultSpots, defaultLines, onUpdateB
           </div>
         </div>
 
-        {/* Data Generation & Controls Toolbar */}
+        {/* Bus Network Dataset Toolbar */}
         <div className="judge-controls-panel">
           <div className="control-group">
             <label><Compass size={17}/> Generate a bus routes dataset:</label>
@@ -547,170 +532,174 @@ export default function PlannerJudgeView({ defaultSpots, defaultLines, onUpdateB
           </button>
         </div>
 
+        {/* Judge Test Batch Toolbar */}
+        <div className="judge-controls-panel">
+          <div className="control-group">
+            <label><Dices size={17}/> Random test routes to judge:</label>
+            <select value={testBatchSize} onChange={handleTestBatchSizeChange}>
+              <option value={10}>10 routes</option>
+              <option value={20}>20 routes</option>
+              <option value={50}>50 routes</option>
+            </select>
+          </div>
+
+          <div className="control-divider"/>
+
+          <button className="btn-synth-generate" onClick={() => handleGenerateTestBatch()}>
+            <RefreshCw size={16}/> 🎲 Re-roll {testBatchSize} Random Routes & Re-judge
+          </button>
+        </div>
+
+        {/* Score Cards - computed ONLY from the test batch shown in the report table below */}
         <div className="planner-scorecards">
-          {Object.entries(plannerSummary).map(([id, summary]) => (
-            <article key={id} className={`scorecard-card ${winner.ids.includes(id) ? 'winner-card' : ''}`}>
-              {winner.ids.includes(id) && <span className="winner-ribbon"><Trophy size={12}/> TOP SCORE</span>}
+          {rankedSummary.map(summary => (
+            <article key={summary.id} className={`scorecard-card ${winner.ids.includes(summary.id) ? 'winner-card' : ''}`}>
+              {winner.ids.includes(summary.id) && <span className="winner-ribbon"><Trophy size={12}/> TOP SCORE</span>}
               <div className="card-header">
                 <h3>{summary.name} Planner</h3>
-                <span className={`pass-badge ${summary.correctRate === 100 ? 'perfect' : 'warning'}`}>{summary.correctRate.toFixed(0)}% valid</span>
+                <span className={`pass-badge ${summary.validRate === 100 ? 'perfect' : 'warning'}`}>{summary.validRate.toFixed(0)}% valid</span>
               </div>
               <div className="card-metrics">
-                <div className="metric-item"><small>Judge score</small><b>{summary.overallScore.toFixed(1)}</b></div>
-                <div className="metric-item"><small>Scenario wins</small><b>{summary.wins}/{summary.totalTests}</b></div>
-                <div className="metric-item"><small>Avg fair cost</small><b>{summary.avgCost.toFixed(1)}</b></div>
-                <div className="metric-item"><small>Avg latency</small><b>{summary.avgDurationMs.toFixed(2)} ms</b></div>
+                <div className="metric-item"><small>Judge score</small><b>{summary.score.toFixed(0)}%</b></div>
+                <div className="metric-item"><small>Routes won</small><b>{summary.wins}/{summary.total}</b></div>
+                <div className="metric-item"><small>Avg total time</small><b>{summary.avgTime != null ? `${summary.avgTime.toFixed(1)} min` : '—'}</b></div>
+                <div className="metric-item"><small>Avg waiting</small><b>{summary.avgWait != null ? `${summary.avgWait.toFixed(1)} min` : '—'}</b></div>
+                <div className="metric-item"><small>Avg transfers</small><b>{summary.avgTransfers != null ? summary.avgTransfers.toFixed(1) : '—'}</b></div>
+                <div className="metric-item"><small>Avg hops</small><b>{summary.avgHops != null ? summary.avgHops.toFixed(1) : '—'}</b></div>
               </div>
-              <div className="planner-verdict-text">All planners are judged with the same cost: one point per hop and three per in-leg transfer.</div>
+              <div className="planner-verdict-text">
+                <b>Judge score</b> = routes won ÷ {summary.total} test routes below. A route is "won" when this
+                planner produced the fastest <b>valid</b> trip — a real timeline simulated from a random
+                departure time, including waiting for each bus's actual schedule (ties broken by fewer bus changes).
+              </div>
             </article>
           ))}
         </div>
 
-        {/* Random Length Test Route Generator */}
-        <div className="interactive-trip-card">
-          <div className="card-title-bar">
-            <h2><Sparkles size={18}/> Random Test Route Generator</h2>
-            <span className="route-length-pill">
-              {testDestinations.length} Stop{testDestinations.length > 1 ? 's' : ''} Tour
-            </span>
+        {/* Full Test Report - the exact routes behind the scores above */}
+        <div className="judge-table-container">
+          <div className="table-header">
+            <h2><BarChart3 size={18}/> Full Test Report</h2>
+            <span>{testRoutes.length} randomly generated routes · click a row to see the full planned path</span>
           </div>
-
-          <div className="test-route-generator-toolbar">
-            <button className="btn-generate-test-route" onClick={handleGenerateRandomLengthTestRoute}>
-              <Dices size={18}/> 🎲 Generate Random Route
-            </button>
-          </div>
-
-          {/* Full Path Display below button */}
-          {startSpot && (
-            <div className="full-path-display-card">
-              <div className="full-path-title">
-                <MapPin size={16}/>
-                <strong>Full Route Path ({testDestinations.length} Stop{testDestinations.length > 1 ? 's' : ''}):</strong>
-              </div>
-              <div className="full-path-chips-flow">
-                <span className="path-chip start-chip">
-                  🚩 <b>{startSpot.name}</b> <small>({startSpot.cn})</small>
-                </span>
-                {testDestinations.map((destId, idx) => {
-                  const destObj = defaultSpots.find(s => s.id === destId);
+          <div style={{ overflowX: 'auto' }}>
+            <table className="judge-results-table">
+              <thead>
+                <tr>
+                  <th style={{ width: '3%' }}>#</th>
+                  <th>Test Route</th>
+                  {Object.keys(routePlanners).map(id => (
+                    <th key={id} className="col-planner">{routePlanners[id].name}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {judgeResults.map((jr, idx) => {
+                  const isOpen = expandedRouteId === jr.route.id;
                   return (
-                    <React.Fragment key={destId}>
-                      <span className="path-arrow">➔</span>
-                      <span className="path-chip dest-chip">
-                        <em>#{idx + 1}</em> <b>{destObj?.name || destId}</b> <small>({destObj?.cn})</small>
-                      </span>
+                    <React.Fragment key={jr.route.id}>
+                      <tr className="judge-table-row" onClick={() => setExpandedRouteId(isOpen ? null : jr.route.id)}>
+                        <td>{idx + 1}</td>
+                        <td className="cell-scenario">
+                          <strong>{describeTestRoute(jr.route, defaultSpots)}</strong>
+                          <p>
+                            Depart {formatClock(jr.route.departureMinute)} · {jr.route.destinations.length} stop{jr.route.destinations.length > 1 ? 's' : ''}
+                            {jr.route.destinations.length > 1 ? ' round trip' : ' one-way'}
+                            {' · '}{isOpen ? <span className="text-subtle"><ChevronUp size={11}/> collapse</span> : <span className="text-subtle"><ChevronDown size={11}/> expand</span>}
+                          </p>
+                        </td>
+                        {Object.keys(routePlanners).map(id => {
+                          const out = jr.outputs[id];
+                          const isWinner = jr.winners.includes(id);
+                          return (
+                            <td key={id} className={`cell-planner-result ${out.isValid ? 'pass' : 'fail'} ${isWinner ? 'winner-cell' : ''}`}>
+                              <div className="result-status">
+                                {out.isValid
+                                  ? <span className="text-success"><CheckCircle2 size={13}/> Valid</span>
+                                  : <span className="text-danger"><XCircle size={13}/> Invalid</span>}
+                                {isWinner && <span className="mini-winner-tag"><Trophy size={10}/> Best</span>}
+                              </div>
+                              {out.isValid ? (
+                                <>
+                                  <div className="result-stat">Arrive {formatClock(out.arrivalMinute)}: <b>{out.timeMinutes} min</b></div>
+                                  <div className="result-stat">{out.transfers} transfer{out.transfers === 1 ? '' : 's'} · {out.waitMinutes} min waiting</div>
+                                </>
+                              ) : (
+                                <div className="result-note">{out.notes[0] || 'No valid route found'}</div>
+                              )}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                      {isOpen && (
+                        <tr className="judge-detail-row">
+                          <td colSpan={2 + Object.keys(routePlanners).length}>
+                            <RouteDetailPanel
+                              route={jr.route}
+                              outputs={jr.outputs}
+                              winners={jr.winners}
+                              lines={activeDataset.lines}
+                              spots={defaultSpots}
+                            />
+                          </td>
+                        </tr>
+                      )}
                     </React.Fragment>
                   );
                 })}
-                {testDestinations.length > 1 && (
-                  <>
-                    <span className="path-arrow">➔</span>
-                    <span className="path-chip return-chip">
-                      🏁 <b>{startSpot.name}</b> <small>(Return)</small>
-                    </span>
-                  </>
-                )}
-              </div>
-            </div>
-          )}
+              </tbody>
+            </table>
+          </div>
         </div>
 
-        {/* Live 3-Planner Output Comparison */}
-        {customRunResults && (
-          <div className="planner-outputs-comparison">
-            <h2 className="section-title">
-              <BarChart3 size={18}/> Live Planned Route Results for Random Route ({testDestinations.length} Stop{testDestinations.length > 1 ? 's' : ''})
-            </h2>
-            <div className="comparison-grid">
-              {Object.keys(routePlanners).map(id => {
-                const out = customRunResults.outputs[id];
-                const lineDetails = activeDataset.lines;
-
-                return (
-                  <div key={id} className={`planner-result-card ${winner.ids.includes(id) ? 'highlight-winner' : ''}`}>
-                    <div className="card-top-bar">
-                      <h3>{out.name} Planner</h3>
-                      <span className={`status-pill ${out.isValid ? 'valid' : 'invalid'}`}>
-                        {out.isValid ? <><CheckCircle2 size={13}/> Valid Route</> : <><XCircle size={13}/> No Route</>}
-                      </span>
-                    </div>
-
-                    <div className="stat-pills">
-                      <div><small>Hops</small><b>{out.hops}</b></div>
-                      <div><small>Transfers</small><b>{out.transfers}</b></div>
-                      <div><small>Fair cost</small><b>{out.cost}</b></div>
-                      <div><small>Latency</small><b>{out.durationMs} ms</b></div>
-                    </div>
-
-                    {/* Full Planned Path Breadcrumbs */}
-                    <div className="planner-full-path-container">
-                      <small>FULL PLANNED PATH:</small>
-                      {out.steps.length > 0 ? (
-                        <div className="planner-path-breadcrumbs">
-                          {(() => {
-                            const nodeIds = [out.steps[0].from, ...out.steps.map(s => s.to)];
-                            return nodeIds.map((spotId, nIdx) => {
-                              const spot = defaultSpots.find(s => s.id === spotId);
-                              const isStart = nIdx === 0;
-                              const isEnd = nIdx === nodeIds.length - 1;
-                              const stepPrev = nIdx > 0 ? out.steps[nIdx - 1] : null;
-                              const lineObj = stepPrev ? lineDetails.find(l => l.id === stepPrev.line) : null;
-
-                              return (
-                                <React.Fragment key={nIdx}>
-                                  {nIdx > 0 && (
-                                    <span className="path-sep">
-                                      <span className="mini-line-tag" style={{ background: lineObj?.color || '#3b82f6' }}>
-                                        {stepPrev?.line}
-                                      </span>
-                                      ➔
-                                    </span>
-                                  )}
-                                  <span className={`path-spot-tag ${isStart ? 'start' : isEnd ? 'end' : ''}`}>
-                                    {spot?.name || spotId}
-                                  </span>
-                                </React.Fragment>
-                              );
-                            });
-                          })()}
-                        </div>
-                      ) : (
-                        <div className="no-steps-text">No route found</div>
-                      )}
-                    </div>
-
-                    <div className="step-breakdown-list">
-                      <small>PLANNED ROUTE STEPS ({out.steps.length} total):</small>
-                      {out.steps.length > 0 ? (
-                        <ol>
-                          {out.steps.map((step, sIdx) => {
-                            const lineObj = lineDetails.find(l => l.id === step.line);
-                            const fromSpot = defaultSpots.find(s => s.id === step.from);
-                            const toSpot = defaultSpots.find(s => s.id === step.to);
-                            return (
-                              <li key={sIdx}>
-                                <span className="line-badge" style={{ background: lineObj?.color || '#3b82f6' }}>
-                                  {step.line}
-                                </span>
-                                <div>
-                                  <b>{fromSpot?.name || step.from}</b> → <b>{toSpot?.name || step.to}</b>
-                                </div>
-                              </li>
-                            );
-                          })}
-                        </ol>
-                      ) : (
-                        <div className="no-steps-text">No route steps (Start & End are same or unreachable).</div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
+        {/* Plain-language report */}
+        <div className="judge-report-section">
+          <h2><ListChecks size={20}/> Judge's Report</h2>
+          <div className="report-content-grid">
+            <div className="report-card">
+              <h3><Info size={15}/> How the score works</h3>
+              <p>
+                Every planner is handed the exact same {testRoutes.length} random routes shown in the table
+                above - each with its own randomized departure time - and graded on a real minute-by-minute
+                timeline, not a flat estimate:
+              </p>
+              <ul>
+                <li>Walk 12 min to the first stop, then <b>wait for that line's actual next bus</b> (every line has a real schedule: a 6-12 min headway and a first departure around 5:20-5:35am, same as the Bus Routes page shows).</li>
+                <li>Ride 4 min per hop; whenever the planner switches lines, wait again for the new line's next departure from wherever the trip is at that moment.</li>
+                <li>Spend 8 min at each requested stop before moving on - which pushes the clock forward and can change how long the <i>next</i> bus takes to arrive.</li>
+              </ul>
+              <p>
+                A route counts as <b>valid</b> only if it rides real bus edges start-to-finish and visits every
+                requested stop. On each route, whichever valid planner(s) post the lowest total time are the
+                <b> winner(s)</b> — ties are broken by whoever needs fewer transfers. The <b>Judge score</b> on
+                each card above is just: routes won ÷ total routes × 100 — nothing hidden.
+              </p>
             </div>
 
+            <div className="report-card">
+              <h3><BarChart3 size={15}/> Key findings</h3>
+              <ul>
+                {rankedSummary.map(s => (
+                  <li key={s.id}>
+                    <b>{s.name}</b>: won {s.wins}/{s.total} routes ({s.score.toFixed(0)}%) · valid on {s.validRate.toFixed(0)}%
+                    {' '}· avg time {s.avgTime != null ? `${s.avgTime.toFixed(1)} min` : '—'}
+                    {' '}(incl. {s.avgWait != null ? `${s.avgWait.toFixed(1)} min waiting` : '—'}) · avg transfers {s.avgTransfers != null ? s.avgTransfers.toFixed(1) : '—'}
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            <div className="report-card highlight-card">
+              <h3><Award size={15}/> Verdict</h3>
+              <p><b>{winner.name}</b></p>
+              <p>{winner.reason}</p>
+              <p>
+                Click <b>"Re-roll"</b> above to generate a fresh batch of random routes — a genuinely
+                better planner should keep winning across many re-rolls, not just one lucky batch.
+              </p>
+            </div>
           </div>
-        )}
+        </div>
 
       </div>
     </section>
