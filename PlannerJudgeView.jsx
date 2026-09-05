@@ -199,7 +199,7 @@ function runPlannerOnRoute(planner, route, lines) {
     if (destinations.length === 1) {
       trip = planner.planTrip({ origin: start, destinations, lines, departureMinute });
     } else {
-      tour = planner.createTour({ origin: start, attractions: destinations, lines });
+      tour = planner.createTour({ origin: start, attractions: destinations, lines, departureMinute });
       trip = planner.planTrip({ origin: start, destinations: [...tour, start], lines, departureMinute });
     }
   } catch (err) {
