@@ -7,6 +7,7 @@ import'./style.css';
 import'./maplibre.css';
 import'./views.css';
 import{getRoutePlanner,routePlanners,defaultRoutePlannerId}from'./route-planners/index.js';
+import{simulateTripTiming,lineFrequency}from'./schedule.js';
 import PlannerJudgeView from'./PlannerJudgeView.jsx';
 
 const spots=[
@@ -160,11 +161,56 @@ function App(){
  const[from,setFrom]=useState(spots[0]?.id || 'home'),[stops,setStops]=useState([]),[roundTrip,setRoundTrip]=useState(false),[pendingStop,setPendingStop]=useState('bund'),[selected,setSelected]=useState(null),[trip,setTrip]=useState(null),[progress,setProgress]=useState(0),[tab,setTab]=useState('planner'),[simSeconds,setSimSeconds]=useState(8*3600),[clockRunning,setClockRunning]=useState(true),[planningMode,setPlanningMode]=useState('now'),[planningTime,setPlanningTime]=useState('09:00'),[plannerId,setPlannerId]=useState(defaultRoutePlannerId);
  const activeRoutePlanner=useMemo(()=>getRoutePlanner(plannerId),[plannerId]);
  const plannedDestinations=useMemo(()=>roundTrip&&stops.length?[...stops,from]:stops,[from,stops,roundTrip]);
- const legs=useMemo(()=>activeRoutePlanner.planTrip({origin:from,destinations:plannedDestinations,lines}),[from,plannedDestinations,activeRoutePlanner,lines]);
+ // Route around the REAL bus schedule for whichever departure mode is
+ // picked below. "Arrive by" has no closed-form answer once wait times
+ // depend on the departure time itself, so it's solved by iterating: guess
+ // a departure, see how long that route actually takes to run against the
+ // schedule, and refine the guess from that - typically settles in 1-2
+ // passes since schedules only change at a handful of minute-of-day marks.
+ const plan=useMemo(()=>{
+  const solveAt=departureMinute=>{
+   const legs=activeRoutePlanner.planTrip({origin:from,destinations:plannedDestinations,lines,departureMinute});
+   const timing=simulateTripTiming(legs,plannedDestinations,from,departureMinute,lines);
+   return{departureMinute,legs,timing};
+  };
+  if(planningMode==='now')return solveAt(Math.floor((simSeconds%86400)/60));
+  const[hours,minutes]=planningTime.split(':').map(Number),pickedMinute=(hours||0)*60+(minutes||0);
+  if(planningMode==='depart')return solveAt(pickedMinute);
+  // Wait times aren't monotonic in departure time (a schedule can dip and
+  // recover a few minutes apart), so a single fixed-point pass can land on
+  // a departure that actually arrives a bit late. Scan a window of nearby
+  // departures and keep whichever is best - the latest one that still
+  // arrives on time, or (if none do, e.g. the target is before the first
+  // bus of the day) whichever gets closest. The whole search is capped by a
+  // wall-clock deadline rather than a fixed iteration count, since a large
+  // synthetic bus network (from the Planner Judge) can make a single search
+  // itself take tens of milliseconds - this keeps "arrive by" from ever
+  // hanging the UI, at the cost of a less exhaustive scan on huge networks.
+  const deadline=performance.now()+150;
+  let guess=pickedMinute,best=solveAt(guess);
+  for(let i=0;i<4&&performance.now()<deadline;i++){
+   const nextGuess=pickedMinute-best.timing.timeMinutes;
+   if(nextGuess===guess)break;
+   guess=nextGuess;
+   best=solveAt(guess);
+  }
+  let bestGuess=guess,bestArrival=guess+best.timing.timeMinutes;
+  for(let offset=-40;offset<=40&&performance.now()<deadline;offset++){
+   const candidateGuess=guess+offset;
+   if(candidateGuess===guess&&offset===0)continue;
+   const candidate=solveAt(candidateGuess);
+   const candidateArrival=candidateGuess+candidate.timing.timeMinutes;
+   const candidateOnTime=candidateArrival<=pickedMinute,bestOnTime=bestArrival<=pickedMinute;
+   const better=(candidateOnTime&&(!bestOnTime||candidateGuess>bestGuess))||(!candidateOnTime&&!bestOnTime&&candidateArrival<bestArrival);
+   if(better){best=candidate;bestGuess=candidateGuess;bestArrival=candidateArrival}
+  }
+  return best;
+ },[planningMode,planningTime,simSeconds,activeRoutePlanner,from,plannedDestinations,lines]);
+ const{legs,timing}=plan,durationMinutes=timing.timeMinutes;
  const result=useMemo(()=>legs.flatMap(l=>l.steps),[legs]);
  const groups=useMemo(()=>result.reduce((combined,step)=>{const previous=combined.at(-1);if(previous&&previous.line===step.line&&previous.to===step.from){previous.to=step.to;previous.count++}else combined.push({...step,count:1});return combined},[]),[result]);
  const transferCount=Math.max(0,groups.length-1);
- const availableStops=spots.filter(s=>s.id!==from&&!stops.includes(s.id)),finalDestination=plannedDestinations.at(-1),durationMinutes=result.length?12+result.length*4+plannedDestinations.length*8:0;
+ const availableStops=spots.filter(s=>s.id!==from&&!stops.includes(s.id)),finalDestination=plannedDestinations.at(-1);
  const schedule=useMemo(()=>{const durationSeconds=durationMinutes*60,[hours,minutes]=planningTime.split(':').map(Number),selectedSeconds=(hours||0)*3600+(minutes||0)*60,nextOccurrence=notBefore=>{let candidate=Math.floor(notBefore/86400)*86400+selectedSeconds;if(candidate<notBefore)candidate+=86400;return candidate};if(planningMode==='arrive'){const arrival=nextOccurrence(simSeconds+durationSeconds);return{departure:arrival-durationSeconds,arrival}}const departure=planningMode==='depart'?nextOccurrence(simSeconds):simSeconds;return{departure,arrival:departure+durationSeconds}},[simSeconds,planningMode,planningTime,durationMinutes]);
  useEffect(()=>{if(!availableStops.some(s=>s.id===pendingStop))setPendingStop(availableStops[0]?.id||'')},[from,stops,pendingStop,availableStops]);
  useEffect(()=>{if(!roundTrip)return;setStops(activeRoutePlanner.createTour({origin:from,attractions:spots.filter(s=>!s.isHome&&!s.isSchool&&s.id!==from).map(s=>s.id),lines}));resetRide()},[plannerId]);
@@ -200,9 +246,9 @@ function App(){
      <label><span className="dot end"/>ADD A STOP</label><div className="stop-adder"><select value={pendingStop} onChange={e=>setPendingStop(e.target.value)} disabled={!availableStops.length}>{availableStops.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select><button onClick={()=>addStop(pendingStop)} disabled={!pendingStop} aria-label="Add selected stop"><Plus size={17}/></button></div>
      <button className="find" disabled={!stops.length||!result.length} onClick={startPlannedTrip}><Navigation size={17}/> Start {roundTrip?'full city tour':stops.length>1?`${stops.length}-stop trip`:'trip'}</button>
     </div>
-    <div className="route-head"><div><small>{stops.length>1?'MULTI-STOP JOURNEY':'QUICKEST JOURNEY'} · {activeRoutePlanner.name.toUpperCase()} PLANNER</small><h3>{result.length?`${durationMinutes} min`:stops.length?'You’re already here!':'Add your first stop'}</h3></div>{result.length>0&&<div className="journey-stats"><span>{result.length} {result.length===1?'hop':'hops'}</span><span>{transferCount} {transferCount===1?'change':'changes'}</span></div>}</div>
+    <div className="route-head"><div><small>{stops.length>1?'MULTI-STOP JOURNEY':'QUICKEST JOURNEY'} · {activeRoutePlanner.name.toUpperCase()} PLANNER</small><h3>{result.length?`${durationMinutes} min`:stops.length?'You’re already here!':'Add your first stop'}</h3></div>{result.length>0&&<div className="journey-stats"><span>{result.length} {result.length===1?'hop':'hops'}</span><span>{transferCount} {transferCount===1?'change':'changes'}</span><span>{timing.waitMinutes} min waiting</span></div>}</div>
     {result.length>0&&<div className="schedule-preview"><div><span>DEPART</span><b>{formatScheduleTime(displaySchedule.departure)}</b><small>{scheduleDay(displaySchedule.departure)}</small></div><ArrowRight size={18}/><div><span>ARRIVE</span><b>{formatScheduleTime(displaySchedule.arrival)}</b><small>{scheduleDay(displaySchedule.arrival)}</small></div></div>}
-    <div className="steps">{groups.map((g,i)=>{const l=lines.find(x=>x.id===g.line),frequency=6+(lines.indexOf(l)%4)*2;return <div className="step" key={`${g.line}-${g.from}-${g.to}-${i}`}><div className="route-badge" style={{background:l?.color||'#3b82f6'}}>{l?.id}</div><div><b>{l?.name}</b><span>{spots.find(s=>s.id===g.from)?.name} → {spots.find(s=>s.id===g.to)?.name}</span><small>{g.count} {g.count===1?'hop':'hops'} · every {frequency} min</small></div><em className={i?'change':'board'}>{i?'CHANGE':'BOARD'}</em></div>})}</div>
+    <div className="steps">{groups.map((g,i)=>{const l=lines.find(x=>x.id===g.line),frequency=lineFrequency(g.line,lines);return <div className="step" key={`${g.line}-${g.from}-${g.to}-${i}`}><div className="route-badge" style={{background:l?.color||'#3b82f6'}}>{l?.id}</div><div><b>{l?.name}</b><span>{spots.find(s=>s.id===g.from)?.name} → {spots.find(s=>s.id===g.to)?.name}</span><small>{g.count} {g.count===1?'hop':'hops'} · every {frequency} min</small></div><em className={i?'change':'board'}>{i?'CHANGE':'BOARD'}</em></div>})}</div>
    </aside>
    <section className="map-wrap">
     <div className="map-top"><div className="map-title"><b>Shanghai</b><span>上海市 · {dateLabel} · 26°C</span></div><div className="map-tools"><div className="sim-clock" aria-live="polite"><Clock size={17}/><div><b>{timeLabel} <em>{timePeriod}</em></b><span>SIMULATED · 60×</span></div><button className="clock-toggle" onClick={()=>setClockRunning(running=>!running)} aria-label={clockRunning?'Pause simulated time':'Resume simulated time'} title={clockRunning?'Pause time':'Resume time'}>{clockRunning?<Pause size={14}/>:<Play size={14}/>}</button></div><button><LocateFixed size={16}/> Center map</button></div></div>
