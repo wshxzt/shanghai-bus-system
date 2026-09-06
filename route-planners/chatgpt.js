@@ -1,4 +1,4 @@
-import{TIME_BASE_MINUTES,RIDE_MINUTES_PER_HOP,DWELL_MINUTES_PER_STOP,nextDeparture}from'../schedule.js';
+import{TIME_BASE_MINUTES,RIDE_MINUTES_PER_HOP,DWELL_MINUTES_PER_STOP,nextDeparture,simulateTripTiming}from'../schedule.js';
 
 const graphCache=new WeakMap();
 
@@ -192,11 +192,61 @@ function twoOptImprove(origin,tour,matrix){
  return best;
 }
 
-function createTour({origin,attractions,lines}){
+// Start with the existing closed tour, then evaluate actual arrival time
+// and line changes. Static hop costs cannot predict connections after a visit.
+function improveTimedTour(origin,tour,lines,departureMinute){
+ const seen=new Set();
+ let best=tour,bestScore=[Infinity,Infinity],evaluations=0;
+ const evaluate=candidate=>{
+  const key=JSON.stringify(candidate);
+  if(seen.has(key))return;
+  seen.add(key);evaluations++;
+  const destinations=[...candidate,origin];
+  const trip=planTripAtTime({origin,destinations,lines,departureMinute});
+  // Missing legs on disconnected networks must never look like fast trips.
+  if(trip.some(leg=>leg.from!==leg.to&&!leg.steps.length))return;
+  const steps=trip.flatMap(leg=>leg.steps);
+  const score=[simulateTripTiming(trip,destinations,origin,departureMinute,lines).timeMinutes,
+   steps.reduce((count,step,index)=>count+(index>0&&steps[index-1].line!==step.line?1:0),0)];
+  if(score[0]<bestScore[0]||(score[0]===bestScore[0]&&score[1]<bestScore[1])){best=candidate;bestScore=score}
+ };
+ // Always check both directions, independent of the additional search budget.
+ evaluate(tour);evaluate([...tour].reverse());
+ if(!Number.isFinite(bestScore[0]))return tour;
+ // Cap extra exact timetable searches on dense networks. The deadline is
+ // checked between candidates; an individual search can exceed it.
+ const limit=lines.length<=20?80:lines.length<=50?24:8,deadline=performance.now()+60;
+ const canContinue=()=>evaluations<limit&&performance.now()<deadline;
+ if(tour.length<=4){
+  // Small tours are cheap enough to enumerate when the budget permits.
+  const visit=(prefix,remaining)=>{
+   if(!canContinue())return;
+   if(!remaining.length){evaluate(prefix);return}
+   remaining.forEach((stop,index)=>visit([...prefix,stop],remaining.filter((_,i)=>i!==index)));
+  };
+  visit([],tour);
+ }else{
+  // Improve the timetable score itself, including swaps that leave the
+  // static distance unchanged. Repeat until stable or the budget runs out.
+  let previous;
+  do{
+   previous=best;
+   for(let start=0;start<previous.length-1&&canContinue();start++){
+    for(let end=start+1;end<previous.length&&canContinue();end++){
+     evaluate([...previous.slice(0,start),...previous.slice(start,end+1).reverse(),...previous.slice(end+1)]);
+    }
+   }
+  }while(best!==previous&&canContinue());
+ }
+ return best;
+}
+
+function createTour({origin,attractions,lines,departureMinute}){
  const unique=[...new Set(attractions)].filter(id=>id!==origin);
  if(unique.length<2)return unique;
  const matrix=buildCostMatrix([origin,...unique],lines);
- return twoOptImprove(origin,nearestNeighborTour(origin,unique,matrix),matrix);
+ const tour=twoOptImprove(origin,nearestNeighborTour(origin,unique,matrix),matrix);
+ return Number.isFinite(departureMinute)?improveTimedTour(origin,tour,lines,departureMinute):tour;
 }
 
 export const chatgptPlanner=Object.freeze({

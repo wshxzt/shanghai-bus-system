@@ -257,79 +257,27 @@ export function judgeTestRoutes(testRoutes, lines) {
   });
 }
 
-function sameTour(a = [], b = []) {
-  return a.length === b.length && a.every((id, index) => id === b[index]);
-}
-
-function reversedTour(a = [], b = []) {
-  return sameTour(a, [...b].reverse());
-}
-
-function outcomeLabel(id, winners, isValid) {
-  if (!isValid) return 'Loss';
-  if (!winners.includes(id)) return 'Loss';
-  return winners.length > 1 ? 'Tie' : 'Win';
-}
-
-// Plain-language win/loss notes tied to how each planner actually searches.
-// All three now share the identical leg-level search once a visiting order
-// is fixed - a Pareto-frontier A* where the physically-last-ridden line
-// survives a sightseeing dwell for transfer-counting purposes - so a
-// single-stop route (no order to choose) is always a genuine tie between
-// them, never a style difference. What still differs is how each one
-// CHOOSES the visiting order for a multi-stop tour:
-// ChatGPT = nearest-neighbor + 2-opt on hop+transfer cost (return leg
-//           included), order fixed before any real clock is checked.
-// Claude  = the same nearest-neighbor + 2-opt order, then times both
-//           directions on the real schedule and keeps whichever is faster.
-// Grok    = builds TWO candidate orders (cheapest-insertion + 3-opt, and
-//           nearest-neighbor + 2-opt), times both directions of each on
-//           the real schedule, and keeps whichever of the four finishes
-//           soonest.
+// Describe measured results separately from each planner's search strategy.
+// Matching/reversed tours alone do not reveal which candidate construction won.
 function explainRouteOutcomes(route, outputs, winners) {
-  const oneStop = route.destinations.length === 1;
-  const chatgptTour = outputs.chatgpt?.tour || [];
-  const claudeTour = outputs.claude?.tour || [];
-  const grokTour = outputs.grok?.tour || [];
-
+  const methods = {
+    chatgpt: 'Times both directions, then searches additional visiting orders within a budget.',
+    claude: 'Times both directions of its nearest-neighbor + 2-opt tour.',
+    grok: 'Times both directions of two candidate tour constructions.',
+  };
+  const reference = outputs[winners[0]];
   return Object.fromEntries(Object.keys(routePlanners).map(id => {
     const out = outputs[id];
-    const label = outcomeLabel(id, winners, out.isValid);
-    if (!out.isValid) return [id, `${label} — no legal path`];
-
-    if (oneStop) {
-      if (label === 'Loss') return [id, `${label} — same real-time search as the others; unexpected on a single leg`];
-      return [id, `${label} — identical real-time search across all three planners on a single leg`];
-    }
-
-    const tour = out.tour || [];
-    const others = { chatgpt: chatgptTour, claude: claudeTour, grok: grokTour };
-    delete others[id];
-    const matchesAny = Object.values(others).some(other => sameTour(tour, other));
-    const reversesAny = Object.values(others).some(other => reversedTour(tour, other));
-
-    if (id === 'grok') {
-      if (label === 'Loss') return [id, `${label} — none of the 4 timed candidates (2 orders × 2 directions) beat this departure`];
-      if (matchesAny) return [id, `${label} — nearest-neighbor + 2-opt order matched another planner; same real clock`];
-      if (reversesAny) return [id, `${label} — same 2-opt cycle as another planner, timed the reverse direction faster`];
-      return [id, `${label} — cheapest-insertion + 3-opt found a visiting order the others didn't try`];
-    }
-
-    if (id === 'chatgpt') {
-      if (label === 'Loss' && reversesAny) return [id, `${label} — same 2-opt order as the winner, but never times the reverse direction`];
-      if (label === 'Loss') return [id, `${label} — nearest-neighbor + 2-opt order is fixed before any real clock is checked`];
-      if (label === 'Tie') return [id, `${label} — this untimed 2-opt order happened to land on the best clock anyway`];
-      return [id, `${label} — untimed 2-opt order still finished first on this departure`];
-    }
-
-    // claude
-    if (label === 'Loss' && !matchesAny && !reversesAny) {
-      return [id, `${label} — Grok's extra insertion + 3-opt construction found a better visiting order`];
-    }
-    if (label === 'Loss') return [id, `${label} — checked both directions of this 2-opt order; still not the fastest`];
-    if (label === 'Tie' && matchesAny) return [id, `${label} — same 2-opt order as another planner; direction check found no improvement here`];
-    if (label === 'Tie') return [id, `${label} — timing both directions of the 2-opt order matched the best clock`];
-    return [id, `${label} — timing both directions of the 2-opt order found the fastest ride`];
+    if (!out.isValid) return [id, 'Loss — no complete legal trip; see route details.'];
+    const won = winners.includes(id), label = won ? (winners.length > 1 ? 'Tie' : 'Win') : 'Loss';
+    let result;
+    if (won) result = `Fastest total time (${out.timeMinutes} min), with ${out.transfers} line changes.`;
+    else if (out.timeMinutes > reference.timeMinutes) result = `${out.timeMinutes - reference.timeMinutes} min slower than the fastest valid trip.`;
+    else result = `Same total time, but ${out.transfers - reference.transfers} more line changes.`;
+    const method = route.destinations.length === 1
+      ? 'Single destination; no visiting order to optimize.'
+      : methods[id];
+    return [id, `${label} — ${result} ${method}`];
   }));
 }
 

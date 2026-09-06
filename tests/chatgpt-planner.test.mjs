@@ -105,3 +105,34 @@ test('time and transfer scores beat or match every walk up to seven hops',()=>{
   assert.ok(compare(score(trip,args),exhaustiveScore(args,7))<=0,`sample ${sample}`);
  }
 });
+
+function permutations(values){
+ if(!values.length)return [[]];
+ return values.flatMap((value,index)=>permutations(values.filter((_,i)=>i!==index)).map(rest=>[value,...rest]));
+}
+
+test('small timed tours match all visiting orders, including the return home',()=>{
+ const lines=[{id:'ring',stops:['home','a','b','c','d','home']},
+  {id:'cross',stops:['b','home','c']},{id:'diagonal',stops:['a','d','c']}];
+ for(const departureMinute of [308,320,481,725]){
+  const args={origin:'home',attractions:['a','b','c','d'],lines,departureMinute};
+  const tour=planner.createTour(args);
+  assert.deepEqual([...tour].sort(),args.attractions);
+  const tourScore=order=>{
+   const tripArgs={...args,destinations:[...order,'home']};
+   const trip=planner.planTrip(tripArgs);validate(trip,tripArgs);
+   return score(trip,tripArgs);
+  };
+  const optimal=permutations(args.attractions).map(tourScore).sort(compare)[0];
+  assert.deepEqual(tourScore(tour),optimal);
+ }
+});
+
+test('timed tour fallback retains all stops and input arrays remain unchanged',()=>{
+ const args={origin:'home',attractions:['a','b','a','home','isolated'],lines:[{id:'bus',stops:['home','a','b']}]};
+ const before=structuredClone(args),untimed=planner.createTour(args);
+ assert.deepEqual(planner.createTour({...args,departureMinute:500}),untimed);
+ assert.deepEqual([...untimed].sort(),['a','b','isolated']);
+ assert.deepEqual(args,before);
+ assert.deepEqual(planner.createTour({...args,departureMinute:NaN}),untimed);
+});
