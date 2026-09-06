@@ -149,18 +149,18 @@ function MapScene({from,targets,bunnyCoord,rideEvent,rideLabel,groups,trip,progr
  return <><div ref={container} className="real-map"/>{!ready&&<div className={'map-status '+(mapError?'failed':'')}><span>{mapError?'Map data could not load':'Loading real Shanghai map…'}</span><small>{mapError?'Check the internet connection and refresh.':'Roads, waterways and buildings'}</small></div>}</>;
 }
 const Bunny=({small=false})=><span className={'bunny '+(small?'small':'')}><i className="ear e1"/><i className="ear e2"/><i className="head">• ᴗ •</i><i className="body"/></span>;
-function BusRoutesView({onPlan}){
+function BusRoutesView({onPlan,lines,spots}){
  return <section className="page-view routes-page"><div className="page-shell">
   <div className="page-hero"><div><small className="page-kicker">SHANGHAI BUS NETWORK</small><h1>Every route,<br/>ready to explore.</h1><p>Browse Bunny’s fictional bus network, see every stop and check the service schedule before hopping aboard.</p></div><div className="page-stats"><div><b>{lines.length}</b><span>routes</span></div><div><b>{lines.length*12}</b><span>buses moving</span></div><div><b>{spots.length}</b><span>connected stops</span></div></div></div>
   <div className="route-grid">{lines.map((l,li)=>{const every=6+(li%4)*2;return <article className="route-card" key={l.id} style={{'--route-color':l.color}}>
    <div className="route-card-head"><div className="route-number">{l.id}</div><div><small>{l.name.toUpperCase()}</small><h2>{spots.find(s=>s.id===l.stops[0]).name} <ArrowRight size={15}/> {spots.find(s=>s.id===l.stops.at(-1)).name}</h2></div><span className="service-live"><i/> LIVE</span></div>
    <div className="route-schedule"><span><Clock size={14}/> Every {every} min</span><span>First 05:{String(20+li%4*5).padStart(2,'0')}</span><span>Last 23:{String(5+li%5*5).padStart(2,'0')}</span></div>
-   <ol className="route-stops-list">{l.stops.map((id,i)=>{const s=spots.find(x=>x.id===id);return <li key={id}><i/><div><b>{s.name}</b><span>{s.cn}</span></div>{(i===0||i===l.stops.length-1)&&<em>{i===0?'START':'END'}</em>}</li>})}</ol>
+   <ol className="route-stops-list">{l.stops.map((id,i)=>{const s=spots.find(x=>x.id===id);return <li key={`${id}-${i}`}><i/><div><b>{s.name}</b><span>{s.cn}</span></div>{(i===0||i===l.stops.length-1)&&<em>{i===0?'START':'END'}</em>}</li>})}</ol>
    <button className="route-plan" onClick={()=>onPlan(l.stops[0],l.stops.at(-1))}>Plan this route <ChevronRight size={16}/></button>
   </article>})}</div>
  </div></section>
 }
-function CityGuideView({onOpen,onAdd,itinerary}){
+function CityGuideView({onOpen,onAdd,itinerary,spots}){
  const[query,setQuery]=useState(''),[kind,setKind]=useState('All');
  const places=spots.filter(s=>!s.isHome),kinds=['All',...new Set(places.map(s=>s.kind))];
  const shown=places.filter(s=>(kind==='All'||s.kind===kind)&&(`${s.name} ${s.cn} ${s.kind}`.toLowerCase().includes(query.toLowerCase())));
@@ -304,7 +304,7 @@ function App(){
      <div className="legend"><b>BUS NETWORK</b>{lines.map(l=><span key={l.id}><i style={{background:l.color}}/>{l.name}</span>)}</div>
     </div>
    </section>
-  </section>:tab==='routes'?<BusRoutesView onPlan={planTrip}/>:tab==='guide'?<CityGuideView onOpen={setSelected} onAdd={addStop} itinerary={stops}/>:<PlannerJudgeView defaultSpots={spots} defaultLines={lines} onUpdateBusData={handleUpdateBusData}/>}
+  </section>:tab==='routes'?<BusRoutesView onPlan={planTrip} lines={lines} spots={spots}/>:tab==='guide'?<CityGuideView onOpen={setSelected} onAdd={addStop} itinerary={stops} spots={spots}/>:<PlannerJudgeView defaultSpots={spots} defaultLines={lines} onUpdateBusData={handleUpdateBusData}/>}
   {selected&&<div className="overlay" onClick={()=>setSelected(null)}><article className="modal" onClick={e=>e.stopPropagation()}><button className="close" onClick={()=>setSelected(null)}><X/></button><div className="photo"><img src={selected.img} alt={selected.name}/><span>{selected.kind}</span></div><div className="modal-body"><small>SHANGHAI CITY GUIDE</small><h2>{selected.name}<i>{selected.cn}</i></h2><p>{selected.desc}</p><button className="go" disabled={stops.includes(selected.id)||selected.id===from} onClick={()=>{addStop(selected.id);setSelected(null)}}>{selected.id===from?'Bunny is already here':stops.includes(selected.id)?'Already in your trip':'Add this as a stop'} <Plus size={16}/></button></div></article></div>}
  </main>
 }

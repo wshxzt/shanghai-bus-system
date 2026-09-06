@@ -412,7 +412,7 @@ function RouteDetailPanel({ route, outputs, winners, lines, spots }) {
 
 // --- Main Component ---
 export default function PlannerJudgeView({ defaultSpots, defaultLines, onUpdateBusData }) {
-  const [routeCount, setRouteCount] = useState(10);
+  const [routeCount, setRouteCount] = useState(defaultLines.length);
   const [customLines, setCustomLines] = useState(null);
 
   const activeLines = useMemo(() => {
